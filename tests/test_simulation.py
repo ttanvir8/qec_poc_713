@@ -304,6 +304,7 @@ def test_computed_audit_inputs_produce_gate_evidence(auditable_tiny_trajectory: 
         observation_flip_mask=np.zeros_like(present),
         observation_expected_mcar=2.0 / 64.0,
         codrift_samples=np.column_stack((np.arange(32), np.arange(32))).astype(np.float64),
+        codrift_marginal_tolerance=0.01,
         pre_onset_scores=np.arange(32, dtype=np.float64),
         pre_onset_labels=np.tile(np.array([False, True]), 16),
     )
@@ -316,10 +317,11 @@ def test_computed_audit_inputs_produce_gate_evidence(auditable_tiny_trajectory: 
 
 def test_observation_gate_checks_mcar_burst_and_flip_budgets(auditable_tiny_trajectory: AuditContext) -> None:
     present = np.ones((10, 2), dtype=np.bool_)
-    valid = present.copy()
-    valid[0, 0] = False
+    mcar = np.zeros_like(present)
+    mcar[0, 0] = True
     burst = np.zeros_like(present)
     burst[1:4, 1] = True
+    valid = present & ~(mcar | burst)
     flips = np.zeros_like(present)
     flips[:5, 0] = True
     result = run_dataset_gates(
@@ -327,6 +329,7 @@ def test_observation_gate_checks_mcar_burst_and_flip_budgets(auditable_tiny_traj
             auditable_tiny_trajectory,
             observation_present=present,
             observation_valid=valid,
+            observation_mcar_mask=mcar,
             observation_burst_mask=burst,
             observation_flip_mask=flips,
             observation_expected_mcar=0.05,
@@ -340,12 +343,72 @@ def test_observation_gate_checks_mcar_burst_and_flip_budgets(auditable_tiny_traj
     assert result.evidence["flip_rate"] == pytest.approx(0.25)
 
 
+def test_observation_gate_separates_independent_mcar_from_combined_burst_validity(
+    auditable_tiny_trajectory: AuditContext,
+) -> None:
+    present = np.ones((5, 2), dtype=np.bool_)
+    mcar = np.zeros_like(present)
+    mcar[0, 0] = True
+    burst = np.zeros_like(present)
+    burst[1:3, 1] = True
+    valid = present & ~(mcar | burst)
+    result = run_dataset_gates(
+        replace(
+            auditable_tiny_trajectory,
+            observation_present=present,
+            observation_valid=valid,
+            observation_mcar_mask=mcar,
+            observation_burst_mask=burst,
+            observation_expected_mcar=0.1,
+            observation_expected_burst=0.2,
+            observation_rate_tolerance=0.001,
+        )
+    )[8]
+    assert result.status is GateStatus.PASS
+    assert result.evidence["mcar_rate"] == pytest.approx(0.1)
+    assert result.evidence["burst_rate"] == pytest.approx(0.2)
+
+
+def test_observation_gate_fails_the_specific_independent_mcar_budget(
+    auditable_tiny_trajectory: AuditContext,
+) -> None:
+    present = np.ones((5, 2), dtype=np.bool_)
+    mcar = np.zeros_like(present)
+    mcar[:2, 0] = True
+    burst = np.zeros_like(present)
+    burst[1:3, 1] = True
+    valid = present & ~(mcar | burst)
+    result = run_dataset_gates(
+        replace(
+            auditable_tiny_trajectory,
+            observation_present=present,
+            observation_valid=valid,
+            observation_mcar_mask=mcar,
+            observation_burst_mask=burst,
+            observation_expected_mcar=0.1,
+            observation_expected_burst=0.2,
+            observation_rate_tolerance=0.001,
+        )
+    )[8]
+    assert result.status is GateStatus.FAIL
+    assert result.evidence["mcar_rate"] == pytest.approx(0.2)
+    assert result.evidence["burst_rate"] == pytest.approx(0.2)
+
+
 def test_codrift_uses_its_own_marginal_tolerance(auditable_tiny_trajectory: AuditContext) -> None:
     samples = np.column_stack((np.arange(20), np.arange(20) * 2.0)).astype(np.float64)
     result = run_dataset_gates(
         replace(auditable_tiny_trajectory, codrift_samples=samples, codrift_marginal_tolerance=0.1)
     )[9]
     assert result.status is GateStatus.FAIL
+
+
+def test_codrift_samples_require_a_dedicated_marginal_tolerance(
+    auditable_tiny_trajectory: AuditContext,
+) -> None:
+    samples = np.column_stack((np.arange(20), np.arange(20))).astype(np.float64)
+    with pytest.raises(ValueError, match="codrift_marginal_tolerance"):
+        run_dataset_gates(replace(auditable_tiny_trajectory, codrift_samples=samples))
 
 
 def test_pre_onset_gate_uses_maximum_feature_departure_deterministically(

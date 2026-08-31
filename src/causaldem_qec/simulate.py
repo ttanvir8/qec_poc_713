@@ -98,6 +98,7 @@ class AuditContext:
     audit_seed: int = 0
     observation_present: np.ndarray | None = None
     observation_valid: np.ndarray | None = None
+    observation_mcar_mask: np.ndarray | None = None
     observation_flip_mask: np.ndarray | None = None
     observation_expected_mcar: float | None = None
     observation_burst_mask: np.ndarray | None = None
@@ -465,16 +466,31 @@ def run_dataset_gates(context: AuditContext) -> tuple[GateResult, ...]:
         denominator = int(present.sum())
         if denominator == 0:
             raise ValueError("observation audit has no present values")
-        mcar_rate = float(np.count_nonzero(present & ~valid) / denominator)
+        burst = context.observation_burst_mask
+        mcar = context.observation_mcar_mask
+        if burst is not None:
+            if burst.shape != present.shape or burst.dtype != np.bool_:
+                raise ValueError("invalid burst audit array")
+            if mcar is None:
+                raise ValueError("burst audit requires an independent MCAR mask")
+        if mcar is None:
+            mcar = present & ~valid
+        if mcar.shape != present.shape or mcar.dtype != np.bool_:
+            raise ValueError("invalid MCAR audit array")
+        combined_missing = mcar if burst is None else mcar | burst
+        if not np.array_equal(valid, present & ~combined_missing):
+            raise ValueError("observation validity does not match missingness masks")
+        mcar_observed = present & mcar
+        if burst is not None:
+            mcar_observed &= ~burst
+        mcar_rate = float(np.count_nonzero(mcar_observed) / denominator)
         expected = context.observation_expected_mcar if context.observation_expected_mcar is not None else 0.0
         tolerance = context.observation_rate_tolerance
         mcar_tolerance = tolerance if tolerance is not None else float(3.0 * np.sqrt(expected * (1.0 - expected) / denominator) + 1.0 / denominator)
         differences = [abs(mcar_rate - expected)]
         observation_evidence.update(mcar_rate=mcar_rate, expected_mcar=expected, mcar_tolerance=mcar_tolerance, samples=denominator)
-        if context.observation_burst_mask is not None:
-            if context.observation_burst_mask.shape != present.shape:
-                raise ValueError("invalid burst audit array")
-            burst_rate = float(np.count_nonzero(context.observation_burst_mask & present) / denominator)
+        if burst is not None:
+            burst_rate = float(np.count_nonzero(burst & present & ~valid) / denominator)
             burst_expected = context.observation_expected_burst if context.observation_expected_burst is not None else 0.0
             burst_tolerance = tolerance if tolerance is not None else float(3.0 * np.sqrt(burst_expected * (1.0 - burst_expected) / denominator) + 1.0 / denominator)
             differences.append(abs(burst_rate - burst_expected))
@@ -500,6 +516,8 @@ def run_dataset_gates(context: AuditContext) -> tuple[GateResult, ...]:
         samples = context.codrift_samples
         if samples.ndim != 2 or samples.shape[1] != 2:
             raise ValueError("codrift samples must have two columns")
+        if context.codrift_marginal_tolerance is None:
+            raise ValueError("codrift samples require codrift_marginal_tolerance")
         covariance = float(np.cov(samples[:, 0], samples[:, 1], bias=True)[0, 1])
         marginal_difference = abs(float(np.ptp(samples[:, 0])) - float(np.ptp(samples[:, 1])))
     codrift_evidence: dict[str, float | int | str | bool] = {
