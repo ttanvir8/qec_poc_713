@@ -5,13 +5,19 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import stim
 
 from causaldem_qec.core import CircuitSpec, TrajectoryJob, load_spec
 from causaldem_qec.simulate import (
     NOISE_KIND,
+    AuditContext,
+    GateStatus,
     bounded_probability,
+    canonicalize_test_dem,
     component_layout,
     generate_dynamics,
+    run_dataset_gates,
+    xor_compose,
 )
 
 
@@ -184,3 +190,77 @@ def test_generator_metadata_contains_resolved_reproduction_parameters(job_for_fa
     path = generate_dynamics(spec, job_for_family("f07"), 64, 8)
     assert path.generator_metadata["resolved_parameters"] == spec.dynamics["f07"]
     assert path.generator_metadata["base_parameters"] == spec.dynamics["f03"]
+
+
+def test_duplicate_detector_signature_uses_exact_odd_parity() -> None:
+    actual = xor_compose(np.array([0.10, 0.20], dtype=np.float64))
+    assert actual == pytest.approx(0.10 * 0.80 + 0.90 * 0.20)
+    assert actual != pytest.approx(0.30)
+
+
+def test_equal_detectors_with_different_logicals_are_static_only() -> None:
+    dem = stim.DetectorErrorModel("error(0.01) D0\nerror(0.02) D0 L0")
+    catalog = canonicalize_test_dem(dem, detector_round={0: 0})
+    assert len(catalog.classes) == 1
+    assert not catalog.classes[0].decoder_compatible
+    assert catalog.ambiguous_logical_mass > 0.0
+
+
+def test_hyperedge_is_measured_but_not_adaptable() -> None:
+    dem = stim.DetectorErrorModel("error(0.03) D0 D1 D2")
+    catalog = canonicalize_test_dem(dem, detector_round={0: 0, 1: 0, 2: 1})
+    assert catalog.hyperedge_mass == pytest.approx(0.03)
+    assert not catalog.classes[0].adaptable
+
+
+@pytest.fixture
+def auditable_tiny_trajectory() -> AuditContext:
+    return AuditContext(
+        reproducible_hashes=True,
+        circuit_dem_valid=True,
+        stationary_rate_difference=0.001,
+        stationary_rate_tolerance=0.01,
+        physical_probability_valid=True,
+        episode_indices_isolated=True,
+        duplicate_composition_exact=True,
+        ambiguity_and_hyperedge_reported=True,
+        target_identifiable=None,
+        observation_budget_difference=0.001,
+        observation_budget_tolerance=0.01,
+        codrift_expected_sign=1,
+        codrift_observed_covariance=0.2,
+        pre_onset_auc=0.5,
+        pre_onset_monte_carlo_half_width=0.03,
+        loaders_and_splits_isolated=True,
+    )
+
+
+def test_all_twelve_quality_gates_are_named(auditable_tiny_trajectory: AuditContext) -> None:
+    results = run_dataset_gates(auditable_tiny_trajectory)
+    assert [result.gate_id for result in results] == [f"DQ{i:02d}" for i in range(1, 13)]
+    assert results[7].status is GateStatus.NOT_RUN
+    assert all(result.status is GateStatus.PASS for index, result in enumerate(results) if index != 7)
+
+
+def test_wrong_codrift_sign_invalidates_condition(auditable_tiny_trajectory: AuditContext) -> None:
+    broken = replace(
+        auditable_tiny_trajectory,
+        codrift_expected_sign=-1,
+        codrift_observed_covariance=0.2,
+    )
+    result = run_dataset_gates(broken)[9]
+    assert result.gate_id == "DQ10"
+    assert result.status is GateStatus.FAIL
+
+
+def test_pre_onset_feature_signal_fails_exogenous_burst_gate(
+    auditable_tiny_trajectory: AuditContext,
+) -> None:
+    broken = replace(
+        auditable_tiny_trajectory,
+        pre_onset_auc=0.75,
+        pre_onset_monte_carlo_half_width=0.03,
+    )
+    result = run_dataset_gates(broken)[10]
+    assert result.gate_id == "DQ11"
+    assert result.status is GateStatus.FAIL

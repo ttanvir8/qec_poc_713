@@ -102,6 +102,28 @@ class LabelTrajectory:
 
 
 @dataclass(frozen=True, slots=True)
+class CanonicalClass:
+    class_id: int
+    detector_signature: tuple[tuple[int, int, int], ...]
+    logical_signatures: tuple[tuple[int, ...], ...]
+    probability: float
+    support_size: int
+    graphlike: bool
+    decoder_compatible: bool
+    adaptable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalCatalog:
+    classes: tuple[CanonicalClass, ...]
+    graphlike_mass: float
+    adaptable_mass: float
+    ambiguous_logical_mass: float
+    hyperedge_mass: float
+    catalog_hash: str
+
+
+@dataclass(frozen=True, slots=True)
 class TrajectoryFailure:
     condition_id: str
     trajectory_id: int

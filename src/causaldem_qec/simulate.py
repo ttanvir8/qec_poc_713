@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from hashlib import sha256
 from types import MappingProxyType
 
@@ -9,7 +11,14 @@ import numpy as np
 import stim  # type: ignore[import-untyped]
 from scipy.special import expit  # type: ignore[import-untyped]
 
-from causaldem_qec.core import CircuitSpec, PocSpec, TrajectoryJob, derive_seed
+from causaldem_qec.core import (
+    CanonicalCatalog,
+    CanonicalClass,
+    CircuitSpec,
+    PocSpec,
+    TrajectoryJob,
+    derive_seed,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +58,56 @@ class BuiltEpisode:
 
 class InvalidCircuit(ValueError):
     pass
+
+
+class GateStatus(StrEnum):
+    PASS = "pass"
+    FAIL = "fail"
+    NOT_RUN = "not_run"
+
+
+@dataclass(frozen=True, slots=True)
+class GateResult:
+    gate_id: str
+    status: GateStatus
+    evidence: Mapping[str, float | int | str | bool]
+    affected_conditions: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AuditContext:
+    reproducible_hashes: bool
+    circuit_dem_valid: bool
+    stationary_rate_difference: float
+    stationary_rate_tolerance: float
+    physical_probability_valid: bool
+    episode_indices_isolated: bool
+    duplicate_composition_exact: bool
+    ambiguity_and_hyperedge_reported: bool
+    target_identifiable: bool | None
+    observation_budget_difference: float
+    observation_budget_tolerance: float
+    codrift_expected_sign: int
+    codrift_observed_covariance: float
+    pre_onset_auc: float
+    pre_onset_monte_carlo_half_width: float
+    loaders_and_splits_isolated: bool
+
+
+DATASET_GATES = (
+    ("DQ01", "reproducible_hashes"),
+    ("DQ02", "valid_circuit_dem"),
+    ("DQ03", "stationary_monte_carlo"),
+    ("DQ04", "physical_probability_bounds"),
+    ("DQ05", "episode_index_isolation"),
+    ("DQ06", "exact_duplicate_composition"),
+    ("DQ07", "ambiguity_and_hyperedge_reported"),
+    ("DQ08", "target_identifiability"),
+    ("DQ09", "observation_corruption_budget"),
+    ("DQ10", "codrift_covariance_sign"),
+    ("DQ11", "burst_pre_onset_independence"),
+    ("DQ12", "loader_source_split_isolation"),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +154,230 @@ def bounded_probability(latent: np.ndarray, lower: np.ndarray, upper: np.ndarray
     if np.any(probability <= lower) or np.any(probability >= upper):
         raise ValueError("saturated bounded transform")
     return probability
+
+
+def xor_compose(probabilities: np.ndarray) -> float:
+    """Return the probability that an odd number of independent faults occurs."""
+    values = np.asarray(probabilities, dtype=np.float64)
+    if values.ndim != 1 or np.any((values < 0.0) | (values >= 0.5)):
+        raise ValueError("invalid duplicate probabilities")
+    return float(-0.5 * np.expm1(np.log1p(-2.0 * values).sum()))
+
+
+def _dem_errors(dem: stim.DetectorErrorModel) -> tuple[tuple[float, tuple[int, ...], tuple[int, ...]], ...]:
+    errors: list[tuple[float, tuple[int, ...], tuple[int, ...]]] = []
+    for instruction in dem.flattened():
+        if instruction.type != "error":
+            continue
+        probability = float(instruction.args_copy()[0])
+        detectors: list[int] = []
+        logicals: list[int] = []
+        for target in instruction.targets_copy():
+            if target.is_separator():
+                if detectors or logicals:
+                    errors.append((probability, tuple(detectors), tuple(logicals)))
+                    detectors, logicals = [], []
+            elif target.is_relative_detector_id():
+                detectors.append(target.val)
+            elif target.is_logical_observable_id():
+                logicals.append(target.val)
+            else:
+                raise InvalidCircuit("unsupported DEM target")
+        if detectors or logicals:
+            errors.append((probability, tuple(detectors), tuple(logicals)))
+    return tuple(errors)
+
+
+def _catalog_from_events(
+    events: Sequence[tuple[float, tuple[tuple[int, int, int], ...], tuple[int, ...], bool]],
+) -> CanonicalCatalog:
+    groups: dict[tuple[tuple[int, int, int], ...], list[tuple[float, tuple[int, ...], bool]]] = {}
+    for probability, detectors, logical_signature, supported in events:
+        groups.setdefault(detectors, []).append((probability, logical_signature, supported))
+    classes: list[CanonicalClass] = []
+    for class_id, signature in enumerate(sorted(groups)):
+        members = groups[signature]
+        unique_logicals: set[tuple[int, ...]] = set()
+        for _, logical_signature, _ in members:
+            unique_logicals.add(logical_signature)
+        sorted_logicals = list(unique_logicals)
+        sorted_logicals.sort()
+        logical_signatures: tuple[tuple[int, ...], ...] = tuple(sorted_logicals)
+        probability = xor_compose(np.asarray([member[0] for member in members], dtype=np.float64))
+        graphlike = len(signature) in (1, 2)
+        decoder_compatible = len(logical_signatures) == 1 and all(member[2] for member in members)
+        classes.append(
+            CanonicalClass(
+                class_id=class_id,
+                detector_signature=signature,
+                logical_signatures=logical_signatures,
+                probability=probability,
+                support_size=len(signature),
+                graphlike=graphlike,
+                decoder_compatible=decoder_compatible,
+                adaptable=graphlike and decoder_compatible,
+            )
+        )
+    canonical = [
+        {
+            "class_id": item.class_id,
+            "detectors": item.detector_signature,
+            "logicals": item.logical_signatures,
+            "probability": item.probability,
+            "support_size": item.support_size,
+            "graphlike": item.graphlike,
+            "decoder_compatible": item.decoder_compatible,
+            "adaptable": item.adaptable,
+        }
+        for item in classes
+    ]
+    graphlike_mass = sum(item.probability for item in classes if item.graphlike)
+    adaptable_mass = sum(item.probability for item in classes if item.adaptable)
+    ambiguous_mass = sum(item.probability for item in classes if len(item.logical_signatures) != 1)
+    hyperedge_mass = sum(item.probability for item in classes if not item.graphlike)
+    return CanonicalCatalog(
+        classes=tuple(classes),
+        graphlike_mass=graphlike_mass,
+        adaptable_mass=adaptable_mass,
+        ambiguous_logical_mass=ambiguous_mass,
+        hyperedge_mass=hyperedge_mass,
+        catalog_hash=sha256(json.dumps(canonical, sort_keys=True).encode("utf-8")).hexdigest(),
+    )
+
+
+def canonicalize_test_dem(
+    dem: stim.DetectorErrorModel, detector_round: Mapping[int, int]
+) -> CanonicalCatalog:
+    """Canonicalize a hand-authored DEM fixture without claiming physical source timing."""
+    events = []
+    for probability, detectors, logicals in _dem_errors(dem):
+        if not detectors:
+            raise InvalidCircuit("DEM error has no detector support")
+        try:
+            source_round = min(detector_round[detector] for detector in detectors)
+        except KeyError as error:
+            raise InvalidCircuit("fixture detector has no round") from error
+        signature = tuple(
+            sorted((detector_round[detector] - source_round, detector, 0) for detector in detectors)
+        )
+        events.append((probability, signature, logicals, True))
+    return _catalog_from_events(events)
+
+
+def _episode_layout(
+    circuit: stim.Circuit, episodes: Sequence[BuiltEpisode]
+) -> tuple[dict[int, tuple[int, int, int, int]], tuple[tuple[int, int, BuiltEpisode], ...]]:
+    detectors: dict[int, tuple[int, int, int, int]] = {}
+    spans: list[tuple[int, int, BuiltEpisode]] = []
+    detector_offset = 0
+    instruction_offset = 0
+    for episode_index, episode in enumerate(episodes):
+        spans.append((instruction_offset, instruction_offset + len(list(episode.circuit)), episode))
+        for local, source_round in enumerate(episode.detector_round):
+            detectors[detector_offset + local] = (
+                episode_index,
+                int(source_round),
+                int(episode.detector_role[local]),
+                int(episode.detector_phase[local]),
+            )
+        detector_offset += episode.detector_round.size
+        instruction_offset += len(list(episode.circuit))
+    if detector_offset != circuit.num_detectors:
+        raise InvalidCircuit("episode map does not cover trajectory detector IDs")
+    return detectors, tuple(spans)
+
+
+def canonicalize_dem(circuit: stim.Circuit, episode_map: Sequence[BuiltEpisode]) -> CanonicalCatalog:
+    """Compile and canonicalize an undecomposed trajectory DEM using physical source locations."""
+    dem = circuit.detector_error_model(
+        decompose_errors=False,
+        approximate_disjoint_errors=False,
+        flatten_loops=True,
+    )
+    detector_map, spans = _episode_layout(circuit, episode_map)
+    explanation_sources: dict[tuple[tuple[int, ...], tuple[int, ...]], list[int]] = {}
+    for explanation in circuit.explain_detector_error_model_errors():
+        detector_targets = tuple(
+            term.dem_target.val
+            for term in explanation.dem_error_terms
+            if term.dem_target.is_relative_detector_id()
+        )
+        logical_targets = tuple(
+            term.dem_target.val
+            for term in explanation.dem_error_terms
+            if term.dem_target.is_logical_observable_id()
+        )
+        if explanation.circuit_error_locations:
+            frames = explanation.circuit_error_locations[0].stack_frames
+            if frames:
+                explanation_sources.setdefault((detector_targets, logical_targets), []).append(
+                    frames[-1].instruction_offset
+                )
+    events: list[tuple[float, tuple[tuple[int, int, int], ...], tuple[int, ...], bool]] = []
+    for probability, detector_ids, observable_ids in _dem_errors(dem):
+        if not detector_ids:
+            continue
+        locations = explanation_sources.get((detector_ids, observable_ids), [])
+        source_instruction = locations.pop(0) if locations else None
+        source_episode = None
+        source_round = None
+        if source_instruction is not None:
+            for candidate_episode, (start, end, episode) in enumerate(spans):
+                if start <= source_instruction < end:
+                    source_episode = candidate_episode
+                    for round_index, (round_start, round_end) in enumerate(episode.round_instruction_ranges):
+                        if round_start <= source_instruction - start < round_end:
+                            source_round = round_index
+                            break
+                    break
+        detector_episodes = {detector_map[item][0] for item in detector_ids}
+        observable_episodes = set(observable_ids)
+        if len(detector_episodes) != 1 or (observable_episodes and observable_episodes != detector_episodes):
+            raise InvalidCircuit("DEM event crosses an episode boundary")
+        episode_index = next(iter(detector_episodes))
+        if source_episode != episode_index or source_round is None:
+            signature = tuple(
+                sorted((detector_map[item][1], detector_map[item][2], detector_map[item][3]) for item in detector_ids)
+            )
+            events.append((probability, signature, (), False))
+            continue
+        signature = tuple(
+            sorted(
+                (detector_map[item][1] - source_round, detector_map[item][2], detector_map[item][3])
+                for item in detector_ids
+            )
+        )
+        logical = tuple(sorted(item - episode_index for item in observable_ids))
+        events.append((probability, signature, logical, True))
+    return _catalog_from_events(events)
+
+
+def run_dataset_gates(context: AuditContext) -> tuple[GateResult, ...]:
+    """Evaluate all dataset gates and retain evidence even when a gate is incomplete."""
+    simple = (
+        ("DQ01", context.reproducible_hashes, {"reproducible_hashes": context.reproducible_hashes}),
+        ("DQ02", context.circuit_dem_valid, {"circuit_dem_valid": context.circuit_dem_valid}),
+        ("DQ04", context.physical_probability_valid, {"physical_probability_valid": context.physical_probability_valid}),
+        ("DQ05", context.episode_indices_isolated, {"episode_indices_isolated": context.episode_indices_isolated}),
+        ("DQ06", context.duplicate_composition_exact, {"duplicate_composition_exact": context.duplicate_composition_exact}),
+        ("DQ07", context.ambiguity_and_hyperedge_reported, {"ambiguity_and_hyperedge_reported": context.ambiguity_and_hyperedge_reported}),
+        ("DQ12", context.loaders_and_splits_isolated, {"loaders_and_splits_isolated": context.loaders_and_splits_isolated}),
+    )
+    results = [
+        GateResult(gate_id, GateStatus.PASS if passed else GateStatus.FAIL, MappingProxyType(evidence), ())
+        for gate_id, passed, evidence in simple
+    ]
+    results.extend(
+        (
+            GateResult("DQ03", GateStatus.PASS if context.stationary_rate_difference <= context.stationary_rate_tolerance else GateStatus.FAIL, MappingProxyType({"difference": context.stationary_rate_difference, "tolerance": context.stationary_rate_tolerance}), ()),
+            GateResult("DQ08", GateStatus.NOT_RUN, MappingProxyType({"target_identifiable": "not_run"}), ()),
+            GateResult("DQ09", GateStatus.PASS if context.observation_budget_difference <= context.observation_budget_tolerance else GateStatus.FAIL, MappingProxyType({"difference": context.observation_budget_difference, "tolerance": context.observation_budget_tolerance}), ()),
+            GateResult("DQ10", GateStatus.PASS if context.codrift_expected_sign * context.codrift_observed_covariance > 0.0 else GateStatus.FAIL, MappingProxyType({"expected_sign": context.codrift_expected_sign, "observed_covariance": context.codrift_observed_covariance}), ()),
+            GateResult("DQ11", GateStatus.PASS if abs(context.pre_onset_auc - 0.5) <= context.pre_onset_monte_carlo_half_width else GateStatus.FAIL, MappingProxyType({"auc": context.pre_onset_auc, "monte_carlo_half_width": context.pre_onset_monte_carlo_half_width}), ()),
+        )
+    )
+    by_id = {item.gate_id: item for item in results}
+    return tuple(by_id[gate_id] for gate_id, _ in DATASET_GATES)
 
 
 def _template(circuit: CircuitSpec) -> stim.Circuit:
