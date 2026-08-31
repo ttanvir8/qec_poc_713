@@ -100,8 +100,14 @@ class AuditContext:
     observation_valid: np.ndarray | None = None
     observation_flip_mask: np.ndarray | None = None
     observation_expected_mcar: float | None = None
+    observation_burst_mask: np.ndarray | None = None
+    observation_expected_burst: float | None = None
+    observation_expected_flip: float | None = None
+    observation_rate_tolerance: float | None = None
     codrift_samples: np.ndarray | None = None
+    codrift_marginal_tolerance: float | None = None
     pre_onset_scores: np.ndarray | None = None
+    pre_onset_feature_scores: np.ndarray | None = None
     pre_onset_labels: np.ndarray | None = None
 
 
@@ -461,15 +467,33 @@ def run_dataset_gates(context: AuditContext) -> tuple[GateResult, ...]:
             raise ValueError("observation audit has no present values")
         mcar_rate = float(np.count_nonzero(present & ~valid) / denominator)
         expected = context.observation_expected_mcar if context.observation_expected_mcar is not None else 0.0
-        observation_difference = abs(mcar_rate - expected)
-        observation_tolerance = float(3.0 * np.sqrt(expected * (1.0 - expected) / denominator) + 1.0 / denominator)
-        observation_evidence.update(mcar_rate=mcar_rate, expected_mcar=expected, samples=denominator, difference=observation_difference, tolerance=observation_tolerance)
+        tolerance = context.observation_rate_tolerance
+        mcar_tolerance = tolerance if tolerance is not None else float(3.0 * np.sqrt(expected * (1.0 - expected) / denominator) + 1.0 / denominator)
+        differences = [abs(mcar_rate - expected)]
+        observation_evidence.update(mcar_rate=mcar_rate, expected_mcar=expected, mcar_tolerance=mcar_tolerance, samples=denominator)
+        if context.observation_burst_mask is not None:
+            if context.observation_burst_mask.shape != present.shape:
+                raise ValueError("invalid burst audit array")
+            burst_rate = float(np.count_nonzero(context.observation_burst_mask & present) / denominator)
+            burst_expected = context.observation_expected_burst if context.observation_expected_burst is not None else 0.0
+            burst_tolerance = tolerance if tolerance is not None else float(3.0 * np.sqrt(burst_expected * (1.0 - burst_expected) / denominator) + 1.0 / denominator)
+            differences.append(abs(burst_rate - burst_expected))
+            observation_evidence.update(burst_rate=burst_rate, expected_burst=burst_expected, burst_tolerance=burst_tolerance)
+            if abs(burst_rate - burst_expected) > burst_tolerance:
+                differences.append(float("inf"))
         if context.observation_flip_mask is not None:
             if context.observation_flip_mask.shape != present.shape:
                 raise ValueError("invalid flip audit array")
-            observation_evidence["flip_rate"] = float(
-                np.count_nonzero(context.observation_flip_mask & present) / denominator
-            )
+            flip_rate = float(np.count_nonzero(context.observation_flip_mask & present) / denominator)
+            flip_expected = context.observation_expected_flip if context.observation_expected_flip is not None else 0.0
+            flip_tolerance = tolerance if tolerance is not None else float(3.0 * np.sqrt(flip_expected * (1.0 - flip_expected) / denominator) + 1.0 / denominator)
+            differences.append(abs(flip_rate - flip_expected))
+            observation_evidence.update(flip_rate=flip_rate, expected_flip=flip_expected, flip_tolerance=flip_tolerance)
+            if abs(flip_rate - flip_expected) > flip_tolerance:
+                differences.append(float("inf"))
+        observation_difference = max(differences)
+        observation_tolerance = mcar_tolerance
+        observation_evidence.update(difference=observation_difference, tolerance=observation_tolerance)
     covariance = context.codrift_observed_covariance
     marginal_difference = 0.0
     if context.codrift_samples is not None:
@@ -483,13 +507,25 @@ def run_dataset_gates(context: AuditContext) -> tuple[GateResult, ...]:
         "observed_covariance": covariance,
         "marginal_range_difference": marginal_difference,
     }
+    codrift_tolerance = context.codrift_marginal_tolerance if context.codrift_marginal_tolerance is not None else context.observation_budget_tolerance
+    codrift_evidence["marginal_tolerance"] = codrift_tolerance
     auc = context.pre_onset_auc
     threshold = context.pre_onset_monte_carlo_half_width
-    if context.pre_onset_scores is not None and context.pre_onset_labels is not None:
-        auc = mann_whitney_auc(context.pre_onset_scores, context.pre_onset_labels)
-        threshold = onset_permutation_threshold(
-            context.pre_onset_scores, context.pre_onset_labels, context.audit_seed
-        )
+    if context.pre_onset_labels is not None:
+        scores = context.pre_onset_feature_scores
+        if scores is None and context.pre_onset_scores is not None:
+            scores = context.pre_onset_scores[:, None]
+        if scores is not None:
+            if scores.ndim != 2 or scores.shape[0] != context.pre_onset_labels.size:
+                raise ValueError("invalid pre-onset feature scores")
+            aucs = np.asarray([mann_whitney_auc(scores[:, column], context.pre_onset_labels) for column in range(scores.shape[1])])
+            auc = float(aucs[np.argmax(np.abs(aucs - 0.5))])
+            rng = np.random.default_rng(context.audit_seed)
+            deviations = np.empty(256, dtype=np.float64)
+            for index in range(deviations.size):
+                permuted = rng.permutation(context.pre_onset_labels)
+                deviations[index] = max(abs(mann_whitney_auc(scores[:, column], permuted) - 0.5) for column in range(scores.shape[1]))
+            threshold = float(np.quantile(deviations, 0.99, method="higher"))
     onset_evidence: dict[str, float | int | str | bool] = {
         "auc": auc,
         "max_abs_departure": abs(auc - 0.5),
@@ -500,7 +536,7 @@ def run_dataset_gates(context: AuditContext) -> tuple[GateResult, ...]:
             GateResult("DQ03", GateStatus.PASS if stationary_difference <= stationary_tolerance else GateStatus.FAIL, MappingProxyType(stationary_evidence), ()),
             GateResult("DQ08", GateStatus.NOT_RUN, MappingProxyType({"target_identifiable": "not_run"}), ()),
             GateResult("DQ09", GateStatus.PASS if observation_difference <= observation_tolerance else GateStatus.FAIL, MappingProxyType(observation_evidence), ()),
-            GateResult("DQ10", GateStatus.PASS if context.codrift_expected_sign * covariance > 0.0 and marginal_difference <= context.observation_budget_tolerance else GateStatus.FAIL, MappingProxyType(codrift_evidence), ()),
+            GateResult("DQ10", GateStatus.PASS if context.codrift_expected_sign * covariance > 0.0 and marginal_difference <= codrift_tolerance else GateStatus.FAIL, MappingProxyType(codrift_evidence), ()),
             GateResult("DQ11", GateStatus.PASS if abs(auc - 0.5) <= threshold else GateStatus.FAIL, MappingProxyType(onset_evidence), ()),
         )
     )

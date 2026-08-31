@@ -312,3 +312,55 @@ def test_computed_audit_inputs_produce_gate_evidence(auditable_tiny_trajectory: 
     assert "mcar_rate" in results["DQ09"].evidence
     assert "marginal_range_difference" in results["DQ10"].evidence
     assert "permutation_threshold" in results["DQ11"].evidence
+
+
+def test_observation_gate_checks_mcar_burst_and_flip_budgets(auditable_tiny_trajectory: AuditContext) -> None:
+    present = np.ones((10, 2), dtype=np.bool_)
+    valid = present.copy()
+    valid[0, 0] = False
+    burst = np.zeros_like(present)
+    burst[1:4, 1] = True
+    flips = np.zeros_like(present)
+    flips[:5, 0] = True
+    result = run_dataset_gates(
+        replace(
+            auditable_tiny_trajectory,
+            observation_present=present,
+            observation_valid=valid,
+            observation_burst_mask=burst,
+            observation_flip_mask=flips,
+            observation_expected_mcar=0.05,
+            observation_expected_burst=0.0,
+            observation_expected_flip=0.0,
+            observation_rate_tolerance=0.01,
+        )
+    )[8]
+    assert result.status is GateStatus.FAIL
+    assert result.evidence["burst_rate"] == pytest.approx(0.15)
+    assert result.evidence["flip_rate"] == pytest.approx(0.25)
+
+
+def test_codrift_uses_its_own_marginal_tolerance(auditable_tiny_trajectory: AuditContext) -> None:
+    samples = np.column_stack((np.arange(20), np.arange(20) * 2.0)).astype(np.float64)
+    result = run_dataset_gates(
+        replace(auditable_tiny_trajectory, codrift_samples=samples, codrift_marginal_tolerance=0.1)
+    )[9]
+    assert result.status is GateStatus.FAIL
+
+
+def test_pre_onset_gate_uses_maximum_feature_departure_deterministically(
+    auditable_tiny_trajectory: AuditContext,
+) -> None:
+    labels = np.tile(np.array([False, True]), 16)
+    features = np.column_stack((np.zeros(32), labels.astype(np.float64)))
+    context = replace(
+        auditable_tiny_trajectory,
+        pre_onset_feature_scores=features,
+        pre_onset_labels=labels,
+        audit_seed=713,
+    )
+    first = run_dataset_gates(context)[10]
+    second = run_dataset_gates(context)[10]
+    assert first.status is GateStatus.FAIL
+    assert first.evidence["max_abs_departure"] == second.evidence["max_abs_departure"]
+    assert first.evidence["permutation_threshold"] == second.evidence["permutation_threshold"]
