@@ -13,6 +13,7 @@ from causaldem_qec.simulate import (
     AuditContext,
     GateStatus,
     bounded_probability,
+    canonicalize_dem,
     canonicalize_dem_truth,
     canonicalize_test_dem,
     component_layout,
@@ -283,3 +284,31 @@ def test_complete_trajectory_dem_truth_is_round_resolved_and_frozen(job_for_fami
 def test_detectorless_dem_event_is_rejected() -> None:
     with pytest.raises(ValueError, match="no detector support"):
         canonicalize_test_dem(stim.DetectorErrorModel("error(0.01) L0"), detector_round={})
+    circuit = stim.Circuit("X_ERROR(0.01) 0\nM 0\nOBSERVABLE_INCLUDE(0) rec[-1]")
+    with pytest.raises(ValueError, match="no detector support"):
+        canonicalize_dem(circuit, ())
+
+
+def test_computed_audit_inputs_produce_gate_evidence(auditable_tiny_trajectory: AuditContext) -> None:
+    circuit = stim.Circuit("X_ERROR(0.1) 0\nM 0\nDETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]")
+    present = np.ones((32, 2), dtype=np.bool_)
+    valid = present.copy()
+    valid[:2, 0] = False
+    context = replace(
+        auditable_tiny_trajectory,
+        stationary_circuit=circuit,
+        stationary_shots=256,
+        audit_seed=713,
+        observation_present=present,
+        observation_valid=valid,
+        observation_flip_mask=np.zeros_like(present),
+        observation_expected_mcar=2.0 / 64.0,
+        codrift_samples=np.column_stack((np.arange(32), np.arange(32))).astype(np.float64),
+        pre_onset_scores=np.arange(32, dtype=np.float64),
+        pre_onset_labels=np.tile(np.array([False, True]), 16),
+    )
+    results = {item.gate_id: item for item in run_dataset_gates(context)}
+    assert "detector_rate" in results["DQ03"].evidence
+    assert "mcar_rate" in results["DQ09"].evidence
+    assert "marginal_range_difference" in results["DQ10"].evidence
+    assert "permutation_threshold" in results["DQ11"].evidence

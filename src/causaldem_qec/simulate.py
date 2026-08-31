@@ -93,6 +93,16 @@ class AuditContext:
     pre_onset_auc: float
     pre_onset_monte_carlo_half_width: float
     loaders_and_splits_isolated: bool
+    stationary_circuit: stim.Circuit | None = None
+    stationary_shots: int = 0
+    audit_seed: int = 0
+    observation_present: np.ndarray | None = None
+    observation_valid: np.ndarray | None = None
+    observation_flip_mask: np.ndarray | None = None
+    observation_expected_mcar: float | None = None
+    codrift_samples: np.ndarray | None = None
+    pre_onset_scores: np.ndarray | None = None
+    pre_onset_labels: np.ndarray | None = None
 
 
 DATASET_GATES = (
@@ -206,7 +216,8 @@ def _catalog_from_events(
         logical_signatures: tuple[tuple[int, ...], ...] = tuple(sorted_logicals)
         probability = xor_compose(np.asarray([member[0] for member in members], dtype=np.float64))
         graphlike = len(signature) in (1, 2)
-        decoder_compatible = len(logical_signatures) == 1 and all(member[2] for member in members)
+        supported = all(member[2] for member in members)
+        decoder_compatible = len(logical_signatures) == 1 and supported
         classes.append(
             CanonicalClass(
                 class_id=class_id,
@@ -215,6 +226,7 @@ def _catalog_from_events(
                 probability=probability,
                 support_size=len(signature),
                 graphlike=graphlike,
+                supported=supported,
                 decoder_compatible=decoder_compatible,
                 adaptable=graphlike and decoder_compatible,
             )
@@ -227,6 +239,7 @@ def _catalog_from_events(
             "probability": item.probability,
             "support_size": item.support_size,
             "graphlike": item.graphlike,
+            "supported": item.supported,
             "decoder_compatible": item.decoder_compatible,
             "adaptable": item.adaptable,
         }
@@ -325,7 +338,7 @@ def _canonical_dem_events(
     events: list[tuple[float, tuple[tuple[int, int, int], ...], tuple[int, ...], bool, int]] = []
     for probability, detector_ids, observable_ids in _dem_errors(dem):
         if not detector_ids:
-            continue
+            raise InvalidCircuit("DEM error has no detector support")
         locations = explanation_sources.get((detector_ids, observable_ids), [])
         source_instruction = locations.pop(0) if locations else None
         source_episode = None
@@ -407,13 +420,88 @@ def run_dataset_gates(context: AuditContext) -> tuple[GateResult, ...]:
         GateResult(gate_id, GateStatus.PASS if passed else GateStatus.FAIL, MappingProxyType(evidence), ())
         for gate_id, passed, evidence in simple
     ]
+    stationary_difference = context.stationary_rate_difference
+    stationary_tolerance = context.stationary_rate_tolerance
+    stationary_evidence: dict[str, float | int | str | bool] = {
+        "difference": stationary_difference,
+        "tolerance": stationary_tolerance,
+    }
+    if context.stationary_circuit is not None and context.stationary_shots > 0:
+        sampler = context.stationary_circuit.compile_detector_sampler(seed=context.audit_seed)
+        detectors, logicals = sampler.sample(
+            shots=context.stationary_shots, separate_observables=True
+        )
+        detector_rate = float(np.mean(detectors, dtype=np.float64))
+        logical_rate = float(np.mean(logicals, dtype=np.float64))
+        stationary_difference = abs(detector_rate - logical_rate)
+        stationary_tolerance = max(
+            3.0 * np.sqrt(detector_rate * (1.0 - detector_rate) / context.stationary_shots),
+            3.0 * np.sqrt(logical_rate * (1.0 - logical_rate) / context.stationary_shots),
+        ) + 1.0 / context.stationary_shots
+        stationary_evidence.update(
+            detector_rate=detector_rate,
+            logical_rate=logical_rate,
+            shots=context.stationary_shots,
+            difference=stationary_difference,
+            tolerance=stationary_tolerance,
+        )
+    observation_difference = context.observation_budget_difference
+    observation_tolerance = context.observation_budget_tolerance
+    observation_evidence: dict[str, float | int | str | bool] = {
+        "difference": observation_difference,
+        "tolerance": observation_tolerance,
+    }
+    if context.observation_present is not None and context.observation_valid is not None:
+        present = context.observation_present
+        valid = context.observation_valid
+        if present.shape != valid.shape or present.dtype != np.bool_ or valid.dtype != np.bool_:
+            raise ValueError("invalid observation audit arrays")
+        denominator = int(present.sum())
+        if denominator == 0:
+            raise ValueError("observation audit has no present values")
+        mcar_rate = float(np.count_nonzero(present & ~valid) / denominator)
+        expected = context.observation_expected_mcar if context.observation_expected_mcar is not None else 0.0
+        observation_difference = abs(mcar_rate - expected)
+        observation_tolerance = float(3.0 * np.sqrt(expected * (1.0 - expected) / denominator) + 1.0 / denominator)
+        observation_evidence.update(mcar_rate=mcar_rate, expected_mcar=expected, samples=denominator, difference=observation_difference, tolerance=observation_tolerance)
+        if context.observation_flip_mask is not None:
+            if context.observation_flip_mask.shape != present.shape:
+                raise ValueError("invalid flip audit array")
+            observation_evidence["flip_rate"] = float(
+                np.count_nonzero(context.observation_flip_mask & present) / denominator
+            )
+    covariance = context.codrift_observed_covariance
+    marginal_difference = 0.0
+    if context.codrift_samples is not None:
+        samples = context.codrift_samples
+        if samples.ndim != 2 or samples.shape[1] != 2:
+            raise ValueError("codrift samples must have two columns")
+        covariance = float(np.cov(samples[:, 0], samples[:, 1], bias=True)[0, 1])
+        marginal_difference = abs(float(np.ptp(samples[:, 0])) - float(np.ptp(samples[:, 1])))
+    codrift_evidence: dict[str, float | int | str | bool] = {
+        "expected_sign": context.codrift_expected_sign,
+        "observed_covariance": covariance,
+        "marginal_range_difference": marginal_difference,
+    }
+    auc = context.pre_onset_auc
+    threshold = context.pre_onset_monte_carlo_half_width
+    if context.pre_onset_scores is not None and context.pre_onset_labels is not None:
+        auc = mann_whitney_auc(context.pre_onset_scores, context.pre_onset_labels)
+        threshold = onset_permutation_threshold(
+            context.pre_onset_scores, context.pre_onset_labels, context.audit_seed
+        )
+    onset_evidence: dict[str, float | int | str | bool] = {
+        "auc": auc,
+        "max_abs_departure": abs(auc - 0.5),
+        "permutation_threshold": threshold,
+    }
     results.extend(
         (
-            GateResult("DQ03", GateStatus.PASS if context.stationary_rate_difference <= context.stationary_rate_tolerance else GateStatus.FAIL, MappingProxyType({"difference": context.stationary_rate_difference, "tolerance": context.stationary_rate_tolerance}), ()),
+            GateResult("DQ03", GateStatus.PASS if stationary_difference <= stationary_tolerance else GateStatus.FAIL, MappingProxyType(stationary_evidence), ()),
             GateResult("DQ08", GateStatus.NOT_RUN, MappingProxyType({"target_identifiable": "not_run"}), ()),
-            GateResult("DQ09", GateStatus.PASS if context.observation_budget_difference <= context.observation_budget_tolerance else GateStatus.FAIL, MappingProxyType({"difference": context.observation_budget_difference, "tolerance": context.observation_budget_tolerance}), ()),
-            GateResult("DQ10", GateStatus.PASS if context.codrift_expected_sign * context.codrift_observed_covariance > 0.0 else GateStatus.FAIL, MappingProxyType({"expected_sign": context.codrift_expected_sign, "observed_covariance": context.codrift_observed_covariance}), ()),
-            GateResult("DQ11", GateStatus.PASS if abs(context.pre_onset_auc - 0.5) <= context.pre_onset_monte_carlo_half_width else GateStatus.FAIL, MappingProxyType({"auc": context.pre_onset_auc, "monte_carlo_half_width": context.pre_onset_monte_carlo_half_width}), ()),
+            GateResult("DQ09", GateStatus.PASS if observation_difference <= observation_tolerance else GateStatus.FAIL, MappingProxyType(observation_evidence), ()),
+            GateResult("DQ10", GateStatus.PASS if context.codrift_expected_sign * covariance > 0.0 and marginal_difference <= context.observation_budget_tolerance else GateStatus.FAIL, MappingProxyType(codrift_evidence), ()),
+            GateResult("DQ11", GateStatus.PASS if abs(auc - 0.5) <= threshold else GateStatus.FAIL, MappingProxyType(onset_evidence), ()),
         )
     )
     by_id = {item.gate_id: item for item in results}

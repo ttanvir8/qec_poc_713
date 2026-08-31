@@ -109,6 +109,7 @@ class CanonicalClass:
     probability: float
     support_size: int
     graphlike: bool
+    supported: bool
     decoder_compatible: bool
     adaptable: bool
 
