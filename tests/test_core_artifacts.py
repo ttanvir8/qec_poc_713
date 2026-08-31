@@ -1,3 +1,4 @@
+import errno
 import json
 import shutil
 from dataclasses import replace
@@ -11,9 +12,12 @@ import causaldem_qec.artifacts as artifact_module
 from causaldem_qec.artifacts import (
     load_labels,
     load_observable,
+    load_sealed_seed,
     publish_trajectory,
     verify_artifact,
+    write_sealed_commitment,
 )
+from causaldem_qec.cli import _freeze_sealed
 from causaldem_qec.core import (
     CircuitSpec,
     LabelTrajectory,
@@ -514,3 +518,37 @@ def test_publish_never_overwrites_conflicting_complete_artifact(
     changed = replace(observable, detector_bits=~observable.detector_bits)
     with pytest.raises(FileExistsError, match="artifact conflict"):
         publish_trajectory(tmp_path, tiny_job, changed, labels, {"schema_version": 1})
+
+
+def test_development_command_cannot_open_private_sealed_manifest(tmp_path: Path) -> None:
+    private = tmp_path / "sealed_private.json"
+    commitment = tmp_path / "sealed_commitment.json"
+    private.write_text('{"root_seed": 99887766}', encoding="utf-8")
+    write_sealed_commitment(private, commitment)
+    with pytest.raises(PermissionError, match="sealed evaluation only"):
+        load_sealed_seed(private, commitment, purpose="development")
+    assert load_sealed_seed(private, commitment, purpose="sealed_evaluation") == 99887766
+
+
+def test_publish_uses_atomic_replace_when_renameat2_is_unsupported(
+    tmp_path: Path, tiny_job: TrajectoryJob, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unsupported(*args: object) -> None:
+        raise OSError(errno.EINVAL, "renameat2 unsupported")
+
+    monkeypatch.setattr(artifact_module, "_rename_with_flags", unsupported)
+    paths = publish_trajectory(tmp_path, tiny_job, _observable(), _labels(), {"schema_version": 1})
+    assert tuple(verify_artifact(path) for path in paths)
+
+
+def test_freeze_refuses_an_existing_commitment_without_creating_private_seed(
+    tmp_path: Path,
+) -> None:
+    spec = load_spec(CONFIG)
+    private = tmp_path / "private.json"
+    commitment = tmp_path / "data" / "manifests" / "sealed_commitment.json"
+    commitment.parent.mkdir(parents=True)
+    commitment.write_text("{}", encoding="utf-8")
+    with pytest.raises(FileExistsError, match="sealed commitment exists"):
+        _freeze_sealed(spec, private, tmp_path)
+    assert not private.exists()

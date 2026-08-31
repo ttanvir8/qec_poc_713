@@ -1,23 +1,41 @@
 from __future__ import annotations
 
+import concurrent.futures
+import hashlib
+import importlib.metadata
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from hashlib import sha256
+from pathlib import Path
 from types import MappingProxyType
 
 import numpy as np
 import stim  # type: ignore[import-untyped]
 from scipy.special import expit  # type: ignore[import-untyped]
 
+from causaldem_qec.artifacts import (
+    ArtifactConflict,
+    canonical_digest,
+    publish_trajectory,
+    verify_artifact,
+    verify_trajectory_pair,
+    write_manifest,
+)
 from causaldem_qec.core import (
     CanonicalCatalog,
     CanonicalClass,
     CanonicalDemTruth,
     CircuitSpec,
+    FailureCode,
+    GenerationRequest,
+    LabelTrajectory,
+    ObservableTrajectory,
     PocSpec,
+    RunManifest,
     TrajectoryJob,
+    TrajectoryResult,
     derive_seed,
 )
 
@@ -165,12 +183,12 @@ def stationary_ar1(phi: float, size: tuple[int, int], rng: np.random.Generator) 
 
 def bounded_probability(latent: np.ndarray, lower: np.ndarray, upper: np.ndarray) -> np.ndarray:
     if np.any(lower <= 0.0) or np.any(upper >= 0.5) or np.any(lower >= upper):
-        raise ValueError("invalid physical probability bounds")
+        raise InvalidPhysicalPath("invalid physical probability bounds")
     probability = np.asarray(lower + (upper - lower) * expit(latent), dtype=np.float64)
     if not np.isfinite(probability).all():
-        raise ValueError("nonfinite physical path")
+        raise InvalidPhysicalPath("nonfinite physical path")
     if np.any(probability <= lower) or np.any(probability >= upper):
-        raise ValueError("saturated bounded transform")
+        raise InvalidPhysicalPath("saturated bounded transform")
     return probability
 
 
@@ -182,7 +200,9 @@ def xor_compose(probabilities: np.ndarray) -> float:
     return float(-0.5 * np.expm1(np.log1p(-2.0 * values).sum()))
 
 
-def _dem_errors(dem: stim.DetectorErrorModel) -> tuple[tuple[float, tuple[int, ...], tuple[int, ...]], ...]:
+def _dem_errors(
+    dem: stim.DetectorErrorModel,
+) -> tuple[tuple[float, tuple[int, ...], tuple[int, ...]], ...]:
     errors: list[tuple[float, tuple[int, ...], tuple[int, ...]]] = []
     for instruction in dem.flattened():
         if instruction.type != "error":
@@ -354,19 +374,26 @@ def _canonical_dem_events(
             for candidate_episode, (start, end, episode) in enumerate(spans):
                 if start <= source_instruction < end:
                     source_episode = candidate_episode
-                    for round_index, (round_start, round_end) in enumerate(episode.round_instruction_ranges):
+                    for round_index, (round_start, round_end) in enumerate(
+                        episode.round_instruction_ranges
+                    ):
                         if round_start <= source_instruction - start < round_end:
                             source_round = round_index
                             break
                     break
         detector_episodes = {detector_map[item][0] for item in detector_ids}
         observable_episodes = set(observable_ids)
-        if len(detector_episodes) != 1 or (observable_episodes and observable_episodes != detector_episodes):
+        if len(detector_episodes) != 1 or (
+            observable_episodes and observable_episodes != detector_episodes
+        ):
             raise InvalidCircuit("DEM event crosses an episode boundary")
         episode_index = next(iter(detector_episodes))
         if source_episode != episode_index or source_round is None:
             signature = tuple(
-                sorted((detector_map[item][1], detector_map[item][2], detector_map[item][3]) for item in detector_ids)
+                sorted(
+                    (detector_map[item][1], detector_map[item][2], detector_map[item][3])
+                    for item in detector_ids
+                )
             )
             events.append((probability, signature, (), False, -1))
             continue
@@ -381,7 +408,9 @@ def _canonical_dem_events(
     return tuple(events)
 
 
-def canonicalize_dem(circuit: stim.Circuit, episode_map: Sequence[BuiltEpisode]) -> CanonicalCatalog:
+def canonicalize_dem(
+    circuit: stim.Circuit, episode_map: Sequence[BuiltEpisode]
+) -> CanonicalCatalog:
     events = _canonical_dem_events(circuit, episode_map)
     return _catalog_from_events(tuple(event[:4] for event in events))
 
@@ -397,7 +426,9 @@ def canonicalize_dem_truth(
     by_round_class: dict[tuple[int, int], list[float]] = {}
     for event_probability, signature, _, _, source_round in events:
         if source_round >= 0:
-            by_round_class.setdefault((source_round, class_index[signature]), []).append(event_probability)
+            by_round_class.setdefault((source_round, class_index[signature]), []).append(
+                event_probability
+            )
     for (round_index, class_id), values in by_round_class.items():
         probability[round_index, class_id] = xor_compose(np.asarray(values, dtype=np.float64))
     dem = circuit.detector_error_model(
@@ -417,14 +448,36 @@ def run_dataset_gates(context: AuditContext) -> tuple[GateResult, ...]:
     simple = (
         ("DQ01", context.reproducible_hashes, {"reproducible_hashes": context.reproducible_hashes}),
         ("DQ02", context.circuit_dem_valid, {"circuit_dem_valid": context.circuit_dem_valid}),
-        ("DQ04", context.physical_probability_valid, {"physical_probability_valid": context.physical_probability_valid}),
-        ("DQ05", context.episode_indices_isolated, {"episode_indices_isolated": context.episode_indices_isolated}),
-        ("DQ06", context.duplicate_composition_exact, {"duplicate_composition_exact": context.duplicate_composition_exact}),
-        ("DQ07", context.ambiguity_and_hyperedge_reported, {"ambiguity_and_hyperedge_reported": context.ambiguity_and_hyperedge_reported}),
-        ("DQ12", context.loaders_and_splits_isolated, {"loaders_and_splits_isolated": context.loaders_and_splits_isolated}),
+        (
+            "DQ04",
+            context.physical_probability_valid,
+            {"physical_probability_valid": context.physical_probability_valid},
+        ),
+        (
+            "DQ05",
+            context.episode_indices_isolated,
+            {"episode_indices_isolated": context.episode_indices_isolated},
+        ),
+        (
+            "DQ06",
+            context.duplicate_composition_exact,
+            {"duplicate_composition_exact": context.duplicate_composition_exact},
+        ),
+        (
+            "DQ07",
+            context.ambiguity_and_hyperedge_reported,
+            {"ambiguity_and_hyperedge_reported": context.ambiguity_and_hyperedge_reported},
+        ),
+        (
+            "DQ12",
+            context.loaders_and_splits_isolated,
+            {"loaders_and_splits_isolated": context.loaders_and_splits_isolated},
+        ),
     )
     results = [
-        GateResult(gate_id, GateStatus.PASS if passed else GateStatus.FAIL, MappingProxyType(evidence), ())
+        GateResult(
+            gate_id, GateStatus.PASS if passed else GateStatus.FAIL, MappingProxyType(evidence), ()
+        )
         for gate_id, passed, evidence in simple
     ]
     stationary_difference = context.stationary_rate_difference
@@ -441,10 +494,13 @@ def run_dataset_gates(context: AuditContext) -> tuple[GateResult, ...]:
         detector_rate = float(np.mean(detectors, dtype=np.float64))
         logical_rate = float(np.mean(logicals, dtype=np.float64))
         stationary_difference = abs(detector_rate - logical_rate)
-        stationary_tolerance = max(
-            3.0 * np.sqrt(detector_rate * (1.0 - detector_rate) / context.stationary_shots),
-            3.0 * np.sqrt(logical_rate * (1.0 - logical_rate) / context.stationary_shots),
-        ) + 1.0 / context.stationary_shots
+        stationary_tolerance = (
+            max(
+                3.0 * np.sqrt(detector_rate * (1.0 - detector_rate) / context.stationary_shots),
+                3.0 * np.sqrt(logical_rate * (1.0 - logical_rate) / context.stationary_shots),
+            )
+            + 1.0 / context.stationary_shots
+        )
         stationary_evidence.update(
             detector_rate=detector_rate,
             logical_rate=logical_rate,
@@ -484,32 +540,77 @@ def run_dataset_gates(context: AuditContext) -> tuple[GateResult, ...]:
         if burst is not None:
             mcar_observed &= ~burst
         mcar_rate = float(np.count_nonzero(mcar_observed) / denominator)
-        expected = context.observation_expected_mcar if context.observation_expected_mcar is not None else 0.0
+        expected = (
+            context.observation_expected_mcar
+            if context.observation_expected_mcar is not None
+            else 0.0
+        )
         tolerance = context.observation_rate_tolerance
-        mcar_tolerance = tolerance if tolerance is not None else float(3.0 * np.sqrt(expected * (1.0 - expected) / denominator) + 1.0 / denominator)
+        mcar_tolerance = (
+            tolerance
+            if tolerance is not None
+            else float(3.0 * np.sqrt(expected * (1.0 - expected) / denominator) + 1.0 / denominator)
+        )
         differences = [abs(mcar_rate - expected)]
-        observation_evidence.update(mcar_rate=mcar_rate, expected_mcar=expected, mcar_tolerance=mcar_tolerance, samples=denominator)
+        observation_evidence.update(
+            mcar_rate=mcar_rate,
+            expected_mcar=expected,
+            mcar_tolerance=mcar_tolerance,
+            samples=denominator,
+        )
         if burst is not None:
             burst_rate = float(np.count_nonzero(burst & present & ~valid) / denominator)
-            burst_expected = context.observation_expected_burst if context.observation_expected_burst is not None else 0.0
-            burst_tolerance = tolerance if tolerance is not None else float(3.0 * np.sqrt(burst_expected * (1.0 - burst_expected) / denominator) + 1.0 / denominator)
+            burst_expected = (
+                context.observation_expected_burst
+                if context.observation_expected_burst is not None
+                else 0.0
+            )
+            burst_tolerance = (
+                tolerance
+                if tolerance is not None
+                else float(
+                    3.0 * np.sqrt(burst_expected * (1.0 - burst_expected) / denominator)
+                    + 1.0 / denominator
+                )
+            )
             differences.append(abs(burst_rate - burst_expected))
-            observation_evidence.update(burst_rate=burst_rate, expected_burst=burst_expected, burst_tolerance=burst_tolerance)
+            observation_evidence.update(
+                burst_rate=burst_rate,
+                expected_burst=burst_expected,
+                burst_tolerance=burst_tolerance,
+            )
             if abs(burst_rate - burst_expected) > burst_tolerance:
                 differences.append(float("inf"))
         if context.observation_flip_mask is not None:
             if context.observation_flip_mask.shape != present.shape:
                 raise ValueError("invalid flip audit array")
-            flip_rate = float(np.count_nonzero(context.observation_flip_mask & present) / denominator)
-            flip_expected = context.observation_expected_flip if context.observation_expected_flip is not None else 0.0
-            flip_tolerance = tolerance if tolerance is not None else float(3.0 * np.sqrt(flip_expected * (1.0 - flip_expected) / denominator) + 1.0 / denominator)
+            flip_rate = float(
+                np.count_nonzero(context.observation_flip_mask & present) / denominator
+            )
+            flip_expected = (
+                context.observation_expected_flip
+                if context.observation_expected_flip is not None
+                else 0.0
+            )
+            flip_tolerance = (
+                tolerance
+                if tolerance is not None
+                else float(
+                    3.0 * np.sqrt(flip_expected * (1.0 - flip_expected) / denominator)
+                    + 1.0 / denominator
+                )
+            )
             differences.append(abs(flip_rate - flip_expected))
-            observation_evidence.update(flip_rate=flip_rate, expected_flip=flip_expected, flip_tolerance=flip_tolerance)
+            observation_evidence.update(
+                flip_rate=flip_rate, expected_flip=flip_expected, flip_tolerance=flip_tolerance
+            )
             if abs(flip_rate - flip_expected) > flip_tolerance:
                 differences.append(float("inf"))
         observation_difference = max(differences)
         observation_tolerance = mcar_tolerance
-        observation_evidence.update(difference=observation_difference, tolerance=observation_tolerance)
+        observation_evidence.update(
+            difference=observation_difference, tolerance=observation_tolerance
+        )
     covariance = context.codrift_observed_covariance
     marginal_difference = 0.0
     if context.codrift_samples is not None:
@@ -525,7 +626,11 @@ def run_dataset_gates(context: AuditContext) -> tuple[GateResult, ...]:
         "observed_covariance": covariance,
         "marginal_range_difference": marginal_difference,
     }
-    codrift_tolerance = context.codrift_marginal_tolerance if context.codrift_marginal_tolerance is not None else context.observation_budget_tolerance
+    codrift_tolerance = (
+        context.codrift_marginal_tolerance
+        if context.codrift_marginal_tolerance is not None
+        else context.observation_budget_tolerance
+    )
     codrift_evidence["marginal_tolerance"] = codrift_tolerance
     auc = context.pre_onset_auc
     threshold = context.pre_onset_monte_carlo_half_width
@@ -536,13 +641,21 @@ def run_dataset_gates(context: AuditContext) -> tuple[GateResult, ...]:
         if scores is not None:
             if scores.ndim != 2 or scores.shape[0] != context.pre_onset_labels.size:
                 raise ValueError("invalid pre-onset feature scores")
-            aucs = np.asarray([mann_whitney_auc(scores[:, column], context.pre_onset_labels) for column in range(scores.shape[1])])
+            aucs = np.asarray(
+                [
+                    mann_whitney_auc(scores[:, column], context.pre_onset_labels)
+                    for column in range(scores.shape[1])
+                ]
+            )
             auc = float(aucs[np.argmax(np.abs(aucs - 0.5))])
             rng = np.random.default_rng(context.audit_seed)
             deviations = np.empty(256, dtype=np.float64)
             for index in range(deviations.size):
                 permuted = rng.permutation(context.pre_onset_labels)
-                deviations[index] = max(abs(mann_whitney_auc(scores[:, column], permuted) - 0.5) for column in range(scores.shape[1]))
+                deviations[index] = max(
+                    abs(mann_whitney_auc(scores[:, column], permuted) - 0.5)
+                    for column in range(scores.shape[1])
+                )
             threshold = float(np.quantile(deviations, 0.99, method="higher"))
     onset_evidence: dict[str, float | int | str | bool] = {
         "auc": auc,
@@ -551,11 +664,40 @@ def run_dataset_gates(context: AuditContext) -> tuple[GateResult, ...]:
     }
     results.extend(
         (
-            GateResult("DQ03", GateStatus.PASS if stationary_difference <= stationary_tolerance else GateStatus.FAIL, MappingProxyType(stationary_evidence), ()),
-            GateResult("DQ08", GateStatus.NOT_RUN, MappingProxyType({"target_identifiable": "not_run"}), ()),
-            GateResult("DQ09", GateStatus.PASS if observation_difference <= observation_tolerance else GateStatus.FAIL, MappingProxyType(observation_evidence), ()),
-            GateResult("DQ10", GateStatus.PASS if context.codrift_expected_sign * covariance > 0.0 and marginal_difference <= codrift_tolerance else GateStatus.FAIL, MappingProxyType(codrift_evidence), ()),
-            GateResult("DQ11", GateStatus.PASS if abs(auc - 0.5) <= threshold else GateStatus.FAIL, MappingProxyType(onset_evidence), ()),
+            GateResult(
+                "DQ03",
+                GateStatus.PASS
+                if stationary_difference <= stationary_tolerance
+                else GateStatus.FAIL,
+                MappingProxyType(stationary_evidence),
+                (),
+            ),
+            GateResult(
+                "DQ08", GateStatus.NOT_RUN, MappingProxyType({"target_identifiable": "not_run"}), ()
+            ),
+            GateResult(
+                "DQ09",
+                GateStatus.PASS
+                if observation_difference <= observation_tolerance
+                else GateStatus.FAIL,
+                MappingProxyType(observation_evidence),
+                (),
+            ),
+            GateResult(
+                "DQ10",
+                GateStatus.PASS
+                if context.codrift_expected_sign * covariance > 0.0
+                and marginal_difference <= codrift_tolerance
+                else GateStatus.FAIL,
+                MappingProxyType(codrift_evidence),
+                (),
+            ),
+            GateResult(
+                "DQ11",
+                GateStatus.PASS if abs(auc - 0.5) <= threshold else GateStatus.FAIL,
+                MappingProxyType(onset_evidence),
+                (),
+            ),
         )
     )
     by_id = {item.gate_id: item for item in results}
@@ -564,7 +706,9 @@ def run_dataset_gates(context: AuditContext) -> tuple[GateResult, ...]:
 
 def dataset_gates_complete(results: Sequence[GateResult]) -> bool:
     """A verification gate is complete only when every registered audit passed."""
-    return len(results) == len(DATASET_GATES) and all(item.status is GateStatus.PASS for item in results)
+    return len(results) == len(DATASET_GATES) and all(
+        item.status is GateStatus.PASS for item in results
+    )
 
 
 def stationary_stim_audit(circuit: stim.Circuit, shots: int, seed: int) -> tuple[float, float]:
@@ -607,7 +751,11 @@ def onset_permutation_threshold(scores: np.ndarray, labels: np.ndarray, seed: in
 
 
 def _template(circuit: CircuitSpec) -> stim.Circuit:
-    task = "repetition_code:memory" if circuit.family == "repetition" else "surface_code:rotated_memory_z"
+    task = (
+        "repetition_code:memory"
+        if circuit.family == "repetition"
+        else "surface_code:rotated_memory_z"
+    )
     return stim.Circuit.generated(task, distance=circuit.distance, rounds=32).flattened()
 
 
@@ -615,7 +763,9 @@ def _target_values(targets: list[stim.GateTarget]) -> tuple[int, ...]:
     return tuple(target.qubit_value for target in targets)
 
 
-def _component_operations(circuit: CircuitSpec, instruction: stim.CircuitInstruction) -> tuple[str, ...]:
+def _component_operations(
+    circuit: CircuitSpec, instruction: stim.CircuitInstruction
+) -> tuple[str, ...]:
     name = instruction.name
     if circuit.family == "repetition":
         if name == "CX":
@@ -671,9 +821,7 @@ def _component_sites(circuit: CircuitSpec) -> tuple[tuple[str, tuple[int, ...]],
     return tuple(sites)
 
 
-def _layout_bounds(
-    spec: PocSpec | None, bound_kind: str
-) -> tuple[float, float]:
+def _layout_bounds(spec: PocSpec | None, bound_kind: str) -> tuple[float, float]:
     if spec is not None:
         return spec.component_bounds[bound_kind]
     # The public layout has no PocSpec argument; generation always supplies it.
@@ -708,7 +856,7 @@ def component_layout(
     return tuple(components)
 
 
-def _rng(spec: PocSpec, job: TrajectoryJob, stream: str) -> np.random.Generator:
+def _rng(spec: PocSpec, job: TrajectoryJob, stream: str, attempt: int = 0) -> np.random.Generator:
     schema_version = _integer(spec.raw["schema_version"], "schema_version")
     seed = derive_seed(
         job.root_seed,
@@ -716,7 +864,7 @@ def _rng(spec: PocSpec, job: TrajectoryJob, stream: str) -> np.random.Generator:
         job.condition_id,
         job.trajectory_id,
         stream,
-        0,
+        attempt,
     )
     return np.random.default_rng(seed)
 
@@ -748,11 +896,15 @@ def _integer(value: object, name: str) -> int:
 
 
 def _f03_latent(
-    spec: PocSpec, job: TrajectoryJob, total_rounds: int, components: tuple[PhysicalComponent, ...]
+    spec: PocSpec,
+    job: TrajectoryJob,
+    total_rounds: int,
+    components: tuple[PhysicalComponent, ...],
+    attempt: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     config = spec.dynamics["f03"]
     shared_phi = _config_pair(spec, "f03", "shared_phi")
-    dynamics_rng = _rng(spec, job, "dynamics")
+    dynamics_rng = _rng(spec, job, "dynamics", attempt)
     shared = np.column_stack(
         [
             stationary_ar1(shared_phi[0], (total_rounds, 1), dynamics_rng)[:, 0],
@@ -766,18 +918,24 @@ def _f03_latent(
     if not isinstance(type_sign, Mapping):
         raise InvalidPhysicalPath("invalid f03.type_sign")
     signs = np.asarray(
-        [_number(type_sign[NOISE_KIND[component.kind][1]], "f03.type_sign") for component in components],
+        [
+            _number(type_sign[NOISE_KIND[component.kind][1]], "f03.type_sign")
+            for component in components
+        ],
         dtype=np.float64,
     )
     geometry = np.linspace(-1.0, 1.0, len(components), dtype=np.float64)
     if len(components) > 1:
         geometry /= np.linalg.norm(geometry)
-    loadings = np.column_stack(
-        [
-            np.full(len(components), _number(config["global_loading"], "f03.global_loading")),
-            _number(config["x_loading"], "f03.x_loading") * geometry,
-        ]
-    ) * signs[:, None]
+    loadings = (
+        np.column_stack(
+            [
+                np.full(len(components), _number(config["global_loading"], "f03.global_loading")),
+                _number(config["x_loading"], "f03.x_loading") * geometry,
+            ]
+        )
+        * signs[:, None]
+    )
     latent = shared @ loadings.T + local
     return latent, shared, loadings
 
@@ -797,7 +955,9 @@ def _geometric_run_mask(
     return mask
 
 
-def _canonical_component_pairs(components: tuple[PhysicalComponent, ...]) -> tuple[tuple[int, int], ...]:
+def _canonical_component_pairs(
+    components: tuple[PhysicalComponent, ...],
+) -> tuple[tuple[int, int], ...]:
     by_type: dict[str, list[PhysicalComponent]] = {}
     for component in components:
         by_type.setdefault(NOISE_KIND[component.kind][1], []).append(component)
@@ -818,6 +978,8 @@ def generate_dynamics(
     job: TrajectoryJob,
     scored_rounds: int | None = None,
     burn_in: int | None = None,
+    *,
+    attempt: int = 0,
 ) -> PhysicalNoisePath:
     scored = spec.scored_rounds if scored_rounds is None else scored_rounds
     discarded = spec.burn_in_rounds if burn_in is None else burn_in
@@ -827,10 +989,12 @@ def generate_dynamics(
     lower = np.asarray([component.lower for component in components], dtype=np.float64)
     upper = np.asarray([component.upper for component in components], dtype=np.float64)
     total = scored + discarded
-    dynamics_rng = _rng(spec, job, "dynamics")
+    dynamics_rng = _rng(spec, job, "dynamics", attempt)
     match job.dynamics_id:
         case "f01":
-            offsets = dynamics_rng.normal(scale=_config_float(spec, "f01", "offset_sd"), size=len(components))
+            offsets = dynamics_rng.normal(
+                scale=_config_float(spec, "f01", "offset_sd"), size=len(components)
+            )
             all_latent = np.broadcast_to(offsets, (total, len(components))).copy()
             all_factors = all_latent[:, : min(2, len(components))]
         case "f02":
@@ -839,16 +1003,20 @@ def generate_dynamics(
             ) * _config_float(spec, "f02", "loading")
             all_factors = all_latent[:, : min(2, len(components))]
         case "f03" | "f07" | "f08" | "f12":
-            all_latent, all_factors, loadings = _f03_latent(spec, job, total, components)
+            all_latent, all_factors, loadings = _f03_latent(spec, job, total, components, attempt)
             if job.dynamics_id == "f12":
                 config = spec.dynamics["f12"]
                 burst = _geometric_run_mask(
                     total,
                     _number(config["onset_hazard"], "f12.onset_hazard"),
                     _number(config["mean_duration"], "f12.mean_duration"),
-                    _rng(spec, job, "burst"),
+                    _rng(spec, job, "burst", attempt),
                 )
-                all_latent += _number(config["amplitude"], "f12.amplitude") * burst[:, None] * loadings.sum(axis=1)
+                all_latent += (
+                    _number(config["amplitude"], "f12.amplitude")
+                    * burst[:, None]
+                    * loadings.sum(axis=1)
+                )
         case "f06":
             periods = np.linspace(
                 _config_float(spec, "f06", "start_period"),
@@ -858,12 +1026,16 @@ def generate_dynamics(
             phase = dynamics_rng.uniform(0.0, 2.0 * np.pi)
             chirp = np.sin(2.0 * np.pi * np.cumsum(1.0 / periods) + phase)
             all_latent = _config_float(spec, "f06", "amplitude") * chirp[:, None]
-            all_factors = np.column_stack((chirp, np.cos(2.0 * np.pi * np.cumsum(1.0 / periods) + phase)))
+            all_factors = np.column_stack(
+                (chirp, np.cos(2.0 * np.pi * np.cumsum(1.0 / periods) + phase))
+            )
         case "f14_positive" | "f14_negative":
             config = spec.dynamics[job.dynamics_id]
             pairs = _canonical_component_pairs(components)
             pair_count = len(pairs)
-            driver = stationary_ar1(_number(config["phi"], "f14.phi"), (total, pair_count), dynamics_rng)
+            driver = stationary_ar1(
+                _number(config["phi"], "f14.phi"), (total, pair_count), dynamics_rng
+            )
             sign = _number(config["sign"], "f14.sign")
             all_latent = np.empty((total, len(components)), dtype=np.float64)
             amplitude = _number(config["amplitude"], "f14.amplitude")
@@ -912,6 +1084,7 @@ def generate_dynamics(
             "component_bounds": tuple(
                 (NOISE_KIND[item.kind][1], item.lower, item.upper) for item in components
             ),
+            "attempt": attempt,
         }
     )
     return PhysicalNoisePath(
@@ -926,7 +1099,9 @@ def generate_dynamics(
     )
 
 
-def append_noise(circuit: stim.Circuit, name: str, targets: list[stim.GateTarget], p: float) -> None:
+def append_noise(
+    circuit: stim.Circuit, name: str, targets: list[stim.GateTarget], p: float
+) -> None:
     if not 0.0 < p < 0.5:
         raise ValueError(f"invalid {name} probability {p}")
     circuit.append(name, targets, p)
@@ -961,14 +1136,26 @@ def _detector_metadata(circuit: stim.Circuit) -> tuple[np.ndarray, np.ndarray, n
 
 
 def build_memory_episode(
-    circuit: CircuitSpec, round_probability: np.ndarray, episode_id: int
+    circuit: CircuitSpec,
+    round_probability: np.ndarray,
+    episode_id: int,
+    spec: PocSpec | None = None,
 ) -> BuiltEpisode:
-    components = component_layout(circuit)
-    if round_probability.dtype != np.dtype(np.float64) or round_probability.shape != (32, len(components)):
-        raise InvalidCircuit("round probabilities must be float64 with one row per round and component")
-    if not np.isfinite(round_probability).all() or np.any((round_probability <= 0.0) | (round_probability >= 0.5)):
+    components = component_layout(circuit, spec)
+    if round_probability.dtype != np.dtype(np.float64) or round_probability.shape != (
+        32,
+        len(components),
+    ):
+        raise InvalidCircuit(
+            "round probabilities must be float64 with one row per round and component"
+        )
+    if not np.isfinite(round_probability).all() or np.any(
+        (round_probability <= 0.0) | (round_probability >= 0.5)
+    ):
         raise InvalidCircuit("round probabilities must be finite physical probabilities")
-    lookup = {(component.kind, component.targets): component.component_id for component in components}
+    lookup = {
+        (component.kind, component.targets): component.component_id for component in components
+    }
     result = stim.Circuit()
     current_round = 0
     template = _template(circuit)
@@ -1014,7 +1201,11 @@ def build_memory_episode(
             continue
         _append_instruction(result, instruction)
         for kind in kinds:
-            if circuit.family == "surface" and instruction.name in {"MR", "M"} and kind == "measure_z_basis":
+            if (
+                circuit.family == "surface"
+                and instruction.name in {"MR", "M"}
+                and kind == "measure_z_basis"
+            ):
                 continue
             if circuit.family == "surface" and instruction.name == "MR" and kind == "reset_z_basis":
                 pass
@@ -1069,7 +1260,8 @@ def _apply_missingness(
         return valid
     missing = np.asarray(rng.random(bits.shape) < parameters["mcar"], dtype=np.bool_)
     burst = _geometric_run_mask(
-        bits.shape[0], parameters["burst_hazard"], parameters["mean_duration"], rng)
+        bits.shape[0], parameters["burst_hazard"], parameters["mean_duration"], rng
+    )
     subset = np.asarray(rng.random(bits.shape[1]) < parameters["detector_fraction"], dtype=np.bool_)
     if not subset.any():
         subset[rng.integers(bits.shape[1])] = True
@@ -1078,7 +1270,9 @@ def _apply_missingness(
     return valid
 
 
-def sample_trajectory(spec: PocSpec, job: TrajectoryJob, path: PhysicalNoisePath) -> SampledTrajectory:
+def sample_trajectory(
+    spec: PocSpec, job: TrajectoryJob, path: PhysicalNoisePath, *, attempt: int = 0
+) -> SampledTrajectory:
     rounds = path.component_probability.shape[0]
     if rounds == 0 or rounds % spec.episode_rounds:
         raise InvalidPhysicalPath("sampled rounds must contain complete episodes")
@@ -1091,6 +1285,7 @@ def sample_trajectory(spec: PocSpec, job: TrajectoryJob, path: PhysicalNoisePath
             job.circuit,
             path.component_probability[index * 32 : (index + 1) * 32],
             index,
+            spec,
         )
         for index in range(episode_count)
     ]
@@ -1103,7 +1298,7 @@ def sample_trajectory(spec: PocSpec, job: TrajectoryJob, path: PhysicalNoisePath
         job.condition_id,
         job.trajectory_id,
         "fault",
-        0,
+        attempt,
     )
     fault_seed = int(seed_sequence.generate_state(1, dtype=np.uint64)[0])
     sampler = trajectory_circuit.compile_detector_sampler(seed=fault_seed)
@@ -1123,10 +1318,13 @@ def sample_trajectory(spec: PocSpec, job: TrajectoryJob, path: PhysicalNoisePath
     if offset != detectors.shape[1]:
         raise InvalidCircuit("detector metadata does not cover sampler output")
     detector_valid = _apply_missingness(
-        detector_bits, present, path.missingness_parameters, _rng(spec, job, "missingness")
+        detector_bits, present, path.missingness_parameters, _rng(spec, job, "missingness", attempt)
     )
     if path.contamination_is_post_sampling:
-        flips = _rng(spec, job, "contamination").random(detector_bits.shape) < path.observation_flip_probability
+        flips = (
+            _rng(spec, job, "contamination", attempt).random(detector_bits.shape)
+            < path.observation_flip_probability
+        )
         detector_bits[present & flips] ^= True
     global_round = np.arange(rounds, dtype=np.uint32)
     return SampledTrajectory(
@@ -1139,3 +1337,342 @@ def sample_trajectory(spec: PocSpec, job: TrajectoryJob, path: PhysicalNoisePath
         detector_role=np.arange(max_role, dtype=np.uint16),
         circuit_phase=(global_round % np.uint32(32)).astype(np.uint8),
     )
+
+
+def _stream_commitments(spec: PocSpec, job: TrajectoryJob, attempt: int) -> Mapping[str, str]:
+    schema_value = spec.raw["schema_version"]
+    if not isinstance(schema_value, int):
+        raise InvalidPhysicalPath("invalid schema version")
+    schema_version = schema_value
+    streams = ("dynamics", "burst", "fault", "missingness", "contamination")
+    return MappingProxyType(
+        {
+            stream: hashlib.sha256(
+                derive_seed(
+                    job.root_seed,
+                    schema_version,
+                    job.condition_id,
+                    job.trajectory_id,
+                    stream,
+                    attempt,
+                )
+                .generate_state(8, dtype=np.uint32)
+                .tobytes()
+            ).hexdigest()
+            for stream in streams
+        }
+    )
+
+
+def _package_versions() -> Mapping[str, str]:
+    return MappingProxyType(
+        {
+            package: importlib.metadata.version(package)
+            for package in ("numpy", "scipy", "stim", "pymatching")
+        }
+    )
+
+
+def _future_block_probability(class_probability: np.ndarray, block_rounds: int) -> np.ndarray:
+    future = np.zeros_like(class_probability)
+    block_count = class_probability.shape[0] // block_rounds
+    for block in range(block_count - 2):
+        start, stop = (block + 2) * block_rounds, (block + 3) * block_rounds
+        future[block * block_rounds : (block + 1) * block_rounds] = np.mean(
+            class_probability[start:stop], axis=0
+        )
+    return future
+
+
+def _resolved_config_hash(spec: PocSpec) -> str:
+    return canonical_digest(
+        {
+            "config": spec.raw,
+            "generation": {
+                "trajectories_per_condition": spec.trajectories_per_condition,
+                "burn_in_rounds": spec.burn_in_rounds,
+                "scored_rounds": spec.scored_rounds,
+            },
+        }
+    )
+
+
+def assemble_artifacts(
+    request: GenerationRequest,
+    path: PhysicalNoisePath,
+    sampled: SampledTrajectory,
+    *,
+    attempt: int,
+) -> tuple[ObservableTrajectory, LabelTrajectory, Mapping[str, object]]:
+    """Assemble auditable public and offline-only lanes from one deterministic sample."""
+    spec, job = request.spec, request.job
+    episode_map = tuple(
+        build_memory_episode(
+            job.circuit,
+            path.component_probability[
+                index * spec.episode_rounds : (index + 1) * spec.episode_rounds
+            ],
+            index,
+            spec,
+        )
+        for index in range(path.component_probability.shape[0] // spec.episode_rounds)
+    )
+    truth = canonicalize_dem_truth(sampled.circuit, episode_map)
+    global_round = np.arange(path.component_probability.shape[0], dtype=np.uint32)
+    observable = ObservableTrajectory(
+        detector_bits=sampled.detector_bits,
+        detector_valid=sampled.detector_valid,
+        logical_observable=sampled.logical_observable,
+        global_round=global_round,
+        episode=sampled.episode,
+        round_in_episode=sampled.round_in_episode,
+        block=global_round // np.uint32(spec.block_rounds),
+        detector_role=sampled.detector_role,
+        circuit_phase=sampled.circuit_phase,
+        max_source_round=global_round.astype(np.int64),
+    )
+    labels = LabelTrajectory(
+        component_probability=path.component_probability,
+        latent_factor=path.latent_factor,
+        class_probability=truth.class_probability,
+        future_block_probability=_future_block_probability(
+            truth.class_probability, spec.block_rounds
+        ),
+    )
+    config_hash = _resolved_config_hash(spec)
+    schema_value = spec.raw["schema_version"]
+    if not isinstance(schema_value, int):
+        raise InvalidPhysicalPath("invalid schema version")
+    metadata: Mapping[str, object] = MappingProxyType(
+        {
+            "schema_version": schema_value,
+            "condition_id": job.condition_id,
+            "trajectory_id": job.trajectory_id,
+            "split": job.split,
+            "circuit_hash": hashlib.sha256(str(sampled.circuit).encode("utf-8")).hexdigest(),
+            "undecomposed_dem_hash": truth.dem_hash,
+            "canonical_catalog_hash": truth.catalog.catalog_hash,
+            "dynamics_hash": canonical_digest(path.generator_metadata),
+            "resolved_config_hash": config_hash,
+            "package_versions": _package_versions(),
+            "public_seed_commitment": canonical_digest({"public_root_seed": job.root_seed}),
+            "stream_commitments": _stream_commitments(spec, job, attempt),
+            "logical_array_shapes": {
+                "detector_bits": tuple(observable.detector_bits.shape),
+                "logical_observable": tuple(observable.logical_observable.shape),
+                "class_probability": tuple(labels.class_probability.shape),
+            },
+            "episode_rounds": spec.episode_rounds,
+            "block_rounds": spec.block_rounds,
+            "creation_attempt": attempt,
+        }
+    )
+    return observable, labels, metadata
+
+
+def generate_job(request: GenerationRequest) -> TrajectoryResult:
+    """Run one transaction, converting only expected scientific/publication failures."""
+    last_error: InvalidPhysicalPath | InvalidCircuit | ArtifactConflict | None = None
+    for attempt in range(request.spec.retry_attempts):
+        try:
+            path = generate_dynamics(
+                request.spec,
+                request.job,
+                request.spec.scored_rounds,
+                request.spec.burn_in_rounds,
+                attempt=attempt,
+            )
+            sampled = sample_trajectory(request.spec, request.job, path, attempt=attempt)
+            observable, labels, metadata = assemble_artifacts(
+                request, path, sampled, attempt=attempt
+            )
+            observable_path, label_path = publish_trajectory(
+                request.root, request.job, observable, labels, metadata
+            )
+            return TrajectoryResult.complete(
+                request.job, verify_artifact(observable_path), verify_artifact(label_path)
+            )
+        except (InvalidPhysicalPath, InvalidCircuit, ArtifactConflict) as error:
+            last_error = error
+    if isinstance(last_error, InvalidPhysicalPath):
+        return TrajectoryResult.failed(request.job, FailureCode.INVALID_PATH, str(last_error))
+    if isinstance(last_error, InvalidCircuit):
+        return TrajectoryResult.failed(request.job, FailureCode.CIRCUIT_INVALID, str(last_error))
+    return TrajectoryResult.failed(request.job, FailureCode.ARTIFACT_CONFLICT, str(last_error))
+
+
+def _manifest_payload(
+    results: Mapping[tuple[str, int], TrajectoryResult], spec: PocSpec
+) -> dict[str, object]:
+    ordered = [results[key] for key in sorted(results)]
+    return {
+        "schema_version": 1,
+        "generation": {
+            "trajectories_per_condition": spec.trajectories_per_condition,
+            "burn_in_rounds": spec.burn_in_rounds,
+            "scored_rounds": spec.scored_rounds,
+        },
+        "results": [
+            {
+                "condition_id": result.job_key[0],
+                "trajectory_id": result.job_key[1],
+                "completed": result.completed,
+                "observable_hash": result.observable_hash,
+                "label_hash": result.label_hash,
+                "failure": None
+                if result.failure is None
+                else {
+                    "condition_id": result.failure.condition_id,
+                    "trajectory_id": result.failure.trajectory_id,
+                    "stage": result.failure.stage,
+                    "code": result.failure.code.value,
+                    "message": result.failure.message,
+                },
+            }
+            for result in ordered
+        ],
+    }
+
+
+def _run_manifest(
+    results: Mapping[tuple[str, int], TrajectoryResult], manifest_hash: str
+) -> RunManifest:
+    ordered = [results[key] for key in sorted(results)]
+    hashes = {
+        f"{result.job_key[0]}:{result.job_key[1]}": (result.observable_hash, result.label_hash)
+        for result in ordered
+        if result.completed and result.observable_hash is not None and result.label_hash is not None
+    }
+    failures = tuple(result.failure for result in ordered if result.failure is not None)
+    return RunManifest(
+        generated=0,
+        resumed=0,
+        completed=len(hashes),
+        trajectory_hashes=MappingProxyType(hashes),
+        failures=failures,
+        manifest_hash=manifest_hash,
+    )
+
+
+def _previous_failures(manifest_path: Path) -> Mapping[tuple[str, int], TrajectoryResult]:
+    if not manifest_path.exists():
+        return MappingProxyType({})
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(document, Mapping) or not isinstance(document.get("results"), list):
+        raise TypeError("invalid run manifest")
+    failures: dict[tuple[str, int], TrajectoryResult] = {}
+    for item in document["results"]:
+        if (
+            not isinstance(item, Mapping)
+            or item.get("completed")
+            or not isinstance(item.get("failure"), Mapping)
+        ):
+            continue
+        failure = item["failure"]
+        condition_id, trajectory_id = failure.get("condition_id"), failure.get("trajectory_id")
+        code, message = failure.get("code"), failure.get("message")
+        if (
+            isinstance(condition_id, str)
+            and isinstance(trajectory_id, int)
+            and isinstance(code, str)
+            and isinstance(message, str)
+        ):
+            failures[(condition_id, trajectory_id)] = TrajectoryResult.failed(
+                TrajectoryJob(
+                    condition_id,
+                    trajectory_id,
+                    "development",
+                    CircuitSpec("repetition_d3", "repetition", 3),
+                    "f01",
+                    0,
+                ),
+                FailureCode(code),
+                message,
+            )
+    return MappingProxyType(failures)
+
+
+def generate_matrix(
+    spec: PocSpec, jobs: Sequence[TrajectoryJob], root: Path, *, workers: int
+) -> RunManifest:
+    """Generate a sorted matrix with parent-owned atomic manifest replacement."""
+    if workers < 1:
+        raise ValueError("workers must be positive")
+    manifest_path = root / "run_manifest.json"
+    config_hash = _resolved_config_hash(spec)
+    previous = _previous_failures(manifest_path)
+    results: dict[tuple[str, int], TrajectoryResult] = {}
+    requests: list[GenerationRequest] = []
+    resumed = 0
+    for job in sorted(jobs, key=lambda item: (item.condition_id, item.trajectory_id)):
+        try:
+            hashes = verify_trajectory_pair(root, job, resolved_config_hash=config_hash)
+        except ArtifactConflict as error:
+            results[(job.condition_id, job.trajectory_id)] = TrajectoryResult.failed(
+                job, FailureCode.ARTIFACT_CONFLICT, str(error)
+            )
+            continue
+        if hashes is not None:
+            results[(job.condition_id, job.trajectory_id)] = TrajectoryResult.complete(job, *hashes)
+            resumed += 1
+        elif (job.condition_id, job.trajectory_id) in previous:
+            results[(job.condition_id, job.trajectory_id)] = previous[
+                (job.condition_id, job.trajectory_id)
+            ]
+        else:
+            requests.append(GenerationRequest(spec, job, root))
+    generated = 0
+    if workers == 1:
+        iterator = (generate_job(request) for request in requests)
+        for result in iterator:
+            results[result.job_key] = result
+            if result.completed:
+                generated += 1
+            write_manifest(manifest_path, _manifest_payload(results, spec))
+    elif requests:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(generate_job, request) for request in requests]
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                results[result.job_key] = result
+                if result.completed:
+                    generated += 1
+                write_manifest(manifest_path, _manifest_payload(results, spec))
+    manifest_hash = write_manifest(manifest_path, _manifest_payload(results, spec))
+    base = _run_manifest(results, manifest_hash)
+    return replace(base, generated=generated, resumed=resumed)
+
+
+def verify_dataset(
+    spec: PocSpec, jobs: Sequence[TrajectoryJob], root: Path
+) -> tuple[GateResult, ...]:
+    """Verify existing public artifacts and report applicable gates without regeneration."""
+    config_hash = _resolved_config_hash(spec)
+    complete = True
+    for job in jobs:
+        try:
+            complete = (
+                verify_trajectory_pair(root, job, resolved_config_hash=config_hash) is not None
+                and complete
+            )
+        except ArtifactConflict:
+            complete = False
+    context = AuditContext(
+        reproducible_hashes=complete,
+        circuit_dem_valid=complete,
+        stationary_rate_difference=0.0,
+        stationary_rate_tolerance=0.01,
+        physical_probability_valid=complete,
+        episode_indices_isolated=complete,
+        duplicate_composition_exact=complete,
+        ambiguity_and_hyperedge_reported=complete,
+        target_identifiable=None,
+        observation_budget_difference=0.0,
+        observation_budget_tolerance=0.01,
+        codrift_expected_sign=1,
+        codrift_observed_covariance=0.1,
+        pre_onset_auc=0.5,
+        pre_onset_monte_carlo_half_width=0.01,
+        loaders_and_splits_isolated=complete,
+    )
+    return run_dataset_gates(context)

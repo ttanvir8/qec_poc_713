@@ -30,6 +30,10 @@ _RENAME_NOREPLACE = 1
 _RENAME_EXCHANGE = 2
 
 
+class ArtifactConflict(FileExistsError, ValueError):
+    """A complete artifact pair already exists but cannot be safely reused."""
+
+
 def _json_value(value: object) -> object:
     if isinstance(value, Mapping):
         return {str(key): _json_value(item) for key, item in value.items()}
@@ -40,6 +44,11 @@ def _json_value(value: object) -> object:
 
 def _canonical_json(value: object) -> bytes:
     return json.dumps(_json_value(value), sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def canonical_digest(value: object) -> str:
+    """Hash canonical public metadata without exposing a seed value."""
+    return hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
 def _sha256(path: Path) -> str:
@@ -159,7 +168,29 @@ def _publish_directory(staging: Path, target: Path) -> tuple[str, tuple[int, int
         if verify_artifact(target) == artifact_hash:
             shutil.rmtree(staging)
             return artifact_hash, None
-        raise FileExistsError(f"artifact conflict: {target}")
+        raise ArtifactConflict(f"artifact conflict: {target}")
+    except OSError as error:
+        if error.errno != errno.EINVAL:
+            raise
+        lock_path = target.with_name(f".{target.name}.publish.lock")
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as lock_error:
+            raise ArtifactConflict(f"artifact publication is busy: {target}") from lock_error
+        try:
+            os.close(descriptor)
+            if target.exists():
+                if verify_artifact(target) == artifact_hash:
+                    shutil.rmtree(staging)
+                    return artifact_hash, None
+                raise ArtifactConflict(f"artifact conflict: {target}")
+            os.replace(staging, target)
+            _fsync_directory(target.parent)
+        finally:
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
     return artifact_hash, staging_identity
 
 
@@ -278,11 +309,11 @@ def _preflight_pair(
     existing_observable = _existing_artifact_hash(observable_path)
     existing_labels = _existing_artifact_hash(label_path)
     if (existing_observable is None) != (existing_labels is None):
-        raise ValueError("incomplete artifact pair")
+        raise ArtifactConflict("incomplete artifact pair")
     if existing_observable is None:
         return False
     if existing_observable != observable_hash or existing_labels != label_hash:
-        raise FileExistsError(f"artifact conflict: {observable_path}")
+        raise ArtifactConflict(f"artifact conflict: {observable_path}")
     return True
 
 
@@ -473,6 +504,82 @@ def load_labels(path: Path, *, purpose: Literal["offline_evaluation"]) -> LabelT
     if metadata.get("artifact_kind") != "labels":
         raise ValueError("label artifact required")
     return _labels_from_npz(path / "arrays.npz")
+
+
+def trajectory_paths(root: Path, job: TrajectoryJob) -> tuple[Path, Path]:
+    observable = (
+        root / "data" / "observable" / job.split / job.condition_id / str(job.trajectory_id)
+    )
+    labels = root / "data" / "labels" / job.split / job.condition_id / str(job.trajectory_id)
+    return observable, labels
+
+
+def verify_trajectory_pair(
+    root: Path, job: TrajectoryJob, *, resolved_config_hash: str
+) -> tuple[str, str] | None:
+    """Return hashes only for a matching, independently verified artifact pair."""
+    observable_path, label_path = trajectory_paths(root, job)
+    observable_exists, label_exists = observable_path.exists(), label_path.exists()
+    if observable_exists != label_exists:
+        raise ArtifactConflict("incomplete artifact pair")
+    if not observable_exists:
+        return None
+    observable_hash, label_hash = verify_artifact(observable_path), verify_artifact(label_path)
+    observable_metadata = _read_verified_metadata(observable_path)
+    label_metadata = _read_verified_metadata(label_path)
+    expected_job = _job_metadata(job)
+    if (
+        observable_metadata.get("artifact_kind") != "observable"
+        or label_metadata.get("artifact_kind") != "labels"
+        or observable_metadata.get("job") != expected_job
+        or label_metadata.get("job") != expected_job
+        or observable_metadata.get("pair_id") != label_metadata.get("pair_id")
+        or not isinstance(observable_metadata.get("pair_id"), str)
+    ):
+        raise ArtifactConflict("artifact pair identity mismatch")
+    observable_run = observable_metadata.get("metadata")
+    label_run = label_metadata.get("metadata")
+    if (
+        not isinstance(observable_run, Mapping)
+        or not isinstance(label_run, Mapping)
+        or observable_run != label_run
+        or observable_run.get("resolved_config_hash") != resolved_config_hash
+    ):
+        raise ArtifactConflict("artifact pair configuration mismatch")
+    return observable_hash, label_hash
+
+
+def write_sealed_commitment(private_path: Path, commitment_path: Path) -> str:
+    """Commit canonical private seed bytes without copying the seed into public data."""
+    private_bytes = private_path.read_bytes()
+    digest = hashlib.sha256(private_bytes).hexdigest()
+    if commitment_path.exists():
+        raise FileExistsError(f"sealed commitment exists: {commitment_path}")
+    commitment_path.parent.mkdir(parents=True, exist_ok=True)
+    commitment_path.write_bytes(_canonical_json({"algorithm": "sha256", "digest": digest}))
+    _fsync_file(commitment_path)
+    _fsync_directory(commitment_path.parent)
+    return digest
+
+
+def load_sealed_seed(
+    private_path: Path,
+    commitment_path: Path,
+    *,
+    purpose: Literal["development", "sealed_evaluation"],
+) -> int:
+    if purpose != "sealed_evaluation":
+        raise PermissionError("sealed evaluation only")
+    private_bytes = private_path.read_bytes()
+    commitment = json.loads(commitment_path.read_text(encoding="utf-8"))
+    if not isinstance(commitment, Mapping) or hashlib.sha256(
+        private_bytes
+    ).hexdigest() != commitment.get("digest"):
+        raise ValueError("sealed commitment mismatch")
+    private = json.loads(private_bytes)
+    if not isinstance(private, Mapping) or isinstance(private.get("root_seed"), bool):
+        raise TypeError("invalid sealed manifest")
+    return int(private["root_seed"])
 
 
 def _atomic_write(path: Path, write: Callable[[Path], object]) -> None:

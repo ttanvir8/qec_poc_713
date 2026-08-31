@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import stim
 
-from causaldem_qec.core import CircuitSpec, TrajectoryJob, load_spec
+from causaldem_qec.core import CircuitSpec, TrajectoryJob, expand_jobs, load_spec
 from causaldem_qec.simulate import (
     NOISE_KIND,
     AuditContext,
@@ -19,6 +19,7 @@ from causaldem_qec.simulate import (
     component_layout,
     dataset_gates_complete,
     generate_dynamics,
+    generate_matrix,
     run_dataset_gates,
     xor_compose,
 )
@@ -77,7 +78,9 @@ def test_observation_corruption_does_not_change_physical_truth(job_for_family) -
 from causaldem_qec.simulate import build_memory_episode, sample_trajectory
 
 
-@pytest.mark.parametrize("circuit_id", ["repetition_d3", "repetition_d5", "surface_d3", "surface_d5"])
+@pytest.mark.parametrize(
+    "circuit_id", ["repetition_d3", "repetition_d5", "surface_d3", "surface_d5"]
+)
 def test_expanded_episode_compiles_without_repeat(circuit_id) -> None:
     spec = load_spec(Path("configs/poc.json"))
     circuit = next(item for item in spec.circuits if item.circuit_id == circuit_id)
@@ -242,7 +245,9 @@ def test_all_twelve_quality_gates_are_named(auditable_tiny_trajectory: AuditCont
     results = run_dataset_gates(auditable_tiny_trajectory)
     assert [result.gate_id for result in results] == [f"DQ{i:02d}" for i in range(1, 13)]
     assert results[7].status is GateStatus.NOT_RUN
-    assert all(result.status is GateStatus.PASS for index, result in enumerate(results) if index != 7)
+    assert all(
+        result.status is GateStatus.PASS for index, result in enumerate(results) if index != 7
+    )
     assert not dataset_gates_complete(results)
 
 
@@ -273,8 +278,12 @@ def test_pre_onset_feature_signal_fails_exogenous_burst_gate(
 def test_complete_trajectory_dem_truth_is_round_resolved_and_frozen(job_for_family) -> None:
     circuit_spec = job_for_family("f03").circuit
     rates = np.full((32, len(component_layout(circuit_spec))), 0.001, dtype=np.float64)
-    episodes = tuple(build_memory_episode(circuit_spec, rates, episode_id) for episode_id in range(2))
-    truth = canonicalize_dem_truth(sum((episode.circuit for episode in episodes), stim.Circuit()), episodes)
+    episodes = tuple(
+        build_memory_episode(circuit_spec, rates, episode_id) for episode_id in range(2)
+    )
+    truth = canonicalize_dem_truth(
+        sum((episode.circuit for episode in episodes), stim.Circuit()), episodes
+    )
     assert truth.class_probability.shape == (64, len(truth.catalog.classes))
     assert np.any(truth.class_probability == 0.0)
     assert truth.dem_hash
@@ -289,7 +298,9 @@ def test_detectorless_dem_event_is_rejected() -> None:
         canonicalize_dem(circuit, ())
 
 
-def test_computed_audit_inputs_produce_gate_evidence(auditable_tiny_trajectory: AuditContext) -> None:
+def test_computed_audit_inputs_produce_gate_evidence(
+    auditable_tiny_trajectory: AuditContext,
+) -> None:
     circuit = stim.Circuit("X_ERROR(0.1) 0\nM 0\nDETECTOR rec[-1]\nOBSERVABLE_INCLUDE(0) rec[-1]")
     present = np.ones((32, 2), dtype=np.bool_)
     valid = present.copy()
@@ -315,7 +326,9 @@ def test_computed_audit_inputs_produce_gate_evidence(auditable_tiny_trajectory: 
     assert "permutation_threshold" in results["DQ11"].evidence
 
 
-def test_observation_gate_checks_mcar_burst_and_flip_budgets(auditable_tiny_trajectory: AuditContext) -> None:
+def test_observation_gate_checks_mcar_burst_and_flip_budgets(
+    auditable_tiny_trajectory: AuditContext,
+) -> None:
     present = np.ones((10, 2), dtype=np.bool_)
     mcar = np.zeros_like(present)
     mcar[0, 0] = True
@@ -427,3 +440,43 @@ def test_pre_onset_gate_uses_maximum_feature_departure_deterministically(
     assert first.status is GateStatus.FAIL
     assert first.evidence["max_abs_departure"] == second.evidence["max_abs_departure"]
     assert first.evidence["permutation_threshold"] == second.evidence["permutation_threshold"]
+
+
+@pytest.fixture
+def tiny_spec():
+    spec = load_spec(Path("configs/poc.json"))
+    circuit = next(item for item in spec.circuits if item.circuit_id == "repetition_d3")
+    return replace(
+        spec,
+        circuits=(circuit,),
+        condition_sets={"distance_3": ("f01",), "distance_5": ()},
+        trajectories_per_condition=2,
+        burn_in_rounds=32,
+        scored_rounds=256,
+    )
+
+
+@pytest.mark.slow
+def test_worker_count_does_not_change_artifact_hashes(tiny_spec, tmp_path: Path) -> None:
+    jobs = expand_jobs(tiny_spec, include_sealed=False)
+    one = generate_matrix(tiny_spec, jobs, tmp_path / "one", workers=1)
+    two = generate_matrix(tiny_spec, reversed(jobs), tmp_path / "two", workers=2)
+    assert one.trajectory_hashes == two.trajectory_hashes
+
+
+def test_resume_skips_only_verified_complete_trajectory(tiny_spec, tmp_path: Path) -> None:
+    jobs = expand_jobs(tiny_spec, include_sealed=False)
+    first = generate_matrix(tiny_spec, jobs, tmp_path, workers=1)
+    second = generate_matrix(tiny_spec, jobs, tmp_path, workers=1)
+    assert second.generated == 0
+    assert second.resumed == first.completed
+
+
+def test_failed_trajectory_remains_in_manifest(tiny_spec, tmp_path: Path) -> None:
+    bad_bounds = dict(tiny_spec.component_bounds)
+    bad_bounds["repetition_data"] = (0.6, 0.7)
+    invalid = replace(tiny_spec, component_bounds=bad_bounds)
+    jobs = expand_jobs(invalid, include_sealed=False)[:1]
+    manifest = generate_matrix(invalid, jobs, tmp_path, workers=1)
+    assert manifest.completed == 0
+    assert manifest.failures[0].trajectory_id == 0

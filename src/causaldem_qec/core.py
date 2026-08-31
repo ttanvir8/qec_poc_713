@@ -141,6 +141,48 @@ class TrajectoryFailure:
     message: str
 
 
+@dataclass(frozen=True, slots=True)
+class GenerationRequest:
+    spec: PocSpec
+    job: TrajectoryJob
+    root: Path
+
+
+@dataclass(frozen=True, slots=True)
+class TrajectoryResult:
+    job_key: tuple[str, int]
+    completed: bool
+    observable_hash: str | None
+    label_hash: str | None
+    failure: TrajectoryFailure | None
+
+    @classmethod
+    def complete(
+        cls, job: TrajectoryJob, observable_hash: str, label_hash: str
+    ) -> TrajectoryResult:
+        return cls((job.condition_id, job.trajectory_id), True, observable_hash, label_hash, None)
+
+    @classmethod
+    def failed(cls, job: TrajectoryJob, code: FailureCode, message: str) -> TrajectoryResult:
+        return cls(
+            (job.condition_id, job.trajectory_id),
+            False,
+            None,
+            None,
+            TrajectoryFailure(job.condition_id, job.trajectory_id, "generate", code, message),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RunManifest:
+    generated: int
+    resumed: int
+    completed: int
+    trajectory_hashes: Mapping[str, tuple[str, str]]
+    failures: tuple[TrajectoryFailure, ...]
+    manifest_hash: str
+
+
 def _require_array(
     value: np.ndarray, name: str, *, ndim: int, dtype: np.dtype[Any] | None = None
 ) -> None:
@@ -279,6 +321,31 @@ class PocSpec:
     retry_attempts: int
     chunk_rounds: int
     roots: Mapping[str, str]
+
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        return _rebuild_poc_spec, (
+            _thaw(self.raw),
+            self.circuits,
+            _thaw(self.condition_sets),
+            _thaw(self.component_bounds),
+            _thaw(self.dynamics),
+            self.public_root_seed,
+            self.trajectories_per_condition,
+            self.burn_in_rounds,
+            self.scored_rounds,
+            self.episode_rounds,
+            self.block_rounds,
+            _thaw(self.target_config),
+            _thaw(self.fit_config),
+            self.forecast_samples,
+            self.forecast_reference_samples,
+            self.forecast_mean_tolerance,
+            self.bootstrap_resamples,
+            self.confidence_level,
+            self.retry_attempts,
+            self.chunk_rounds,
+            _thaw(self.roots),
+        )
 
 
 def _stable_words(parts: tuple[str | int, ...]) -> list[int]:
@@ -448,14 +515,7 @@ def _validate_dynamics(dynamics: Mapping[str, object]) -> Mapping[str, Mapping[s
     return MappingProxyType(validated)
 
 
-def load_spec(path: Path) -> PocSpec:
-    try:
-        loaded: object = json.loads(path.read_text(encoding="utf-8"))
-    except OSError as error:
-        raise ValueError(f"could not read config: {path}") from error
-    except json.JSONDecodeError as error:
-        raise ValueError(f"invalid JSON config: {path}") from error
-    config = _mapping(loaded, "config")
+def _load_spec_config(config: Mapping[str, object]) -> PocSpec:
     _exact_keys(config, _TOP_LEVEL_KEYS, "config")
 
     if _integer(config["schema_version"], "schema_version") != 1:
@@ -670,3 +730,47 @@ def expand_jobs(spec: PocSpec, *, include_sealed: bool) -> tuple[TrajectoryJob, 
                     )
                 )
     return tuple(jobs)
+
+
+def _thaw(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    return value
+
+
+def _rebuild_poc_spec(*values: object) -> PocSpec:
+    return PocSpec(
+        raw=_freeze_mapping(cast(Mapping[str, object], values[0])),
+        circuits=cast(tuple[CircuitSpec, ...], values[1]),
+        condition_sets=cast(Mapping[str, tuple[str, ...]], _freeze(values[2])),
+        component_bounds=cast(Mapping[str, tuple[float, float]], _freeze(values[3])),
+        dynamics=cast(Mapping[str, Mapping[str, object]], _freeze(values[4])),
+        public_root_seed=cast(int, values[5]),
+        trajectories_per_condition=cast(int, values[6]),
+        burn_in_rounds=cast(int, values[7]),
+        scored_rounds=cast(int, values[8]),
+        episode_rounds=cast(int, values[9]),
+        block_rounds=cast(int, values[10]),
+        target_config=cast(Mapping[str, float | int], _freeze(values[11])),
+        fit_config=cast(Mapping[str, tuple[float, ...]], _freeze(values[12])),
+        forecast_samples=cast(int, values[13]),
+        forecast_reference_samples=cast(int, values[14]),
+        forecast_mean_tolerance=cast(float, values[15]),
+        bootstrap_resamples=cast(int, values[16]),
+        confidence_level=cast(float, values[17]),
+        retry_attempts=cast(int, values[18]),
+        chunk_rounds=cast(int, values[19]),
+        roots=cast(Mapping[str, str], _freeze(values[20])),
+    )
+
+
+def load_spec(path: Path) -> PocSpec:
+    try:
+        loaded: object = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise ValueError(f"could not read config: {path}") from error
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid JSON config: {path}") from error
+    return _load_spec_config(_mapping(loaded, "config"))
