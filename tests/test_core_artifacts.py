@@ -1,10 +1,29 @@
 import json
+from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 import pytest
 
-from causaldem_qec.core import derive_seed, expand_jobs, load_spec, source_cutoff, target_interval
+from causaldem_qec.artifacts import (
+    load_labels,
+    load_observable,
+    publish_trajectory,
+    verify_artifact,
+)
+from causaldem_qec.core import (
+    CircuitSpec,
+    LabelTrajectory,
+    ObservableTrajectory,
+    TrajectoryJob,
+    derive_seed,
+    expand_jobs,
+    load_spec,
+    source_cutoff,
+    target_interval,
+    validate_observable,
+)
 
 CONFIG = Path("configs/poc.json")
 
@@ -96,3 +115,134 @@ def test_retry_count_rejects_more_than_three_attempts(tmp_path: Path) -> None:
     path = _modified_config(tmp_path, "runtime", "retry_attempts", 4)
     with pytest.raises(ValueError, match="retry_attempts must not exceed 3"):
         load_spec(path)
+
+
+@pytest.fixture
+def tiny_job() -> TrajectoryJob:
+    return TrajectoryJob(
+        condition_id="repetition_d3__f01",
+        trajectory_id=0,
+        split="train",
+        circuit=CircuitSpec("repetition_d3", "repetition", 3),
+        dynamics_id="f01",
+        root_seed=713,
+    )
+
+
+def _observable(rounds: int = 64, detectors: int = 3) -> ObservableTrajectory:
+    bits = np.zeros((rounds, detectors), dtype=np.bool_)
+    index = np.arange(rounds, dtype=np.uint32)
+    return ObservableTrajectory(
+        detector_bits=bits,
+        detector_valid=np.ones_like(bits),
+        logical_observable=np.zeros(rounds // 32, dtype=np.bool_),
+        global_round=index,
+        episode=index // 32,
+        round_in_episode=index % 32,
+        block=index // 256,
+        detector_role=np.arange(detectors, dtype=np.uint16),
+        circuit_phase=(index % 32).astype(np.uint8),
+        max_source_round=index.astype(np.int64),
+    )
+
+
+def _labels(rounds: int = 64, classes: int = 2) -> LabelTrajectory:
+    probability = np.full((rounds, classes), 0.01, dtype=np.float64)
+    return LabelTrajectory(
+        component_probability=probability,
+        latent_factor=np.zeros((rounds, 2), dtype=np.float64),
+        class_probability=probability.copy(),
+        future_block_probability=np.empty((0, classes), dtype=np.float64),
+    )
+
+
+def test_observable_and_labels_publish_to_separate_hashes(
+    tmp_path: Path, tiny_job: TrajectoryJob
+) -> None:
+    observable = _observable()
+    labels = _labels()
+    observable_path, label_path = publish_trajectory(
+        tmp_path, tiny_job, observable, labels, {"schema_version": 1}
+    )
+    assert observable_path.parts[-4] == "observable"
+    assert label_path.parts[-4] == "labels"
+    assert verify_artifact(observable_path) != verify_artifact(label_path)
+    assert load_observable(observable_path).detector_bits.dtype == np.bool_
+    assert (
+        load_labels(label_path, purpose="offline_evaluation").class_probability.dtype == np.float64
+    )
+
+
+def test_standard_loader_rejects_label_artifact(tmp_path: Path, tiny_job: TrajectoryJob) -> None:
+    _, label_path = publish_trajectory(
+        tmp_path,
+        tiny_job,
+        _observable(),
+        _labels(),
+        {"schema_version": 1},
+    )
+    with pytest.raises(ValueError, match="observable artifact required"):
+        load_observable(label_path)
+
+
+def test_loader_rejects_a_checksum_corrupted_artifact(
+    tmp_path: Path, tiny_job: TrajectoryJob
+) -> None:
+    observable_path, _ = publish_trajectory(
+        tmp_path,
+        tiny_job,
+        _observable(),
+        _labels(),
+        {"schema_version": 1},
+    )
+    (observable_path / "arrays.npz").write_bytes(b"corrupt")
+    with pytest.raises(ValueError, match="artifact checksum mismatch"):
+        load_observable(observable_path)
+
+
+def test_validation_accepts_a_chunk_with_absolute_episode_numbers() -> None:
+    observable = _observable()
+    validate_observable(replace(observable, episode=observable.episode + np.uint32(16)))
+
+
+def test_publish_rejects_labels_with_a_different_round_count(
+    tmp_path: Path, tiny_job: TrajectoryJob
+) -> None:
+    with pytest.raises(ValueError, match="label rounds must match observable rounds"):
+        publish_trajectory(
+            tmp_path, tiny_job, _observable(), _labels(rounds=63), {"schema_version": 1}
+        )
+
+
+def test_publish_accepts_the_mapping_contract_for_metadata(
+    tmp_path: Path, tiny_job: TrajectoryJob
+) -> None:
+    observable_path, _ = publish_trajectory(
+        tmp_path,
+        tiny_job,
+        _observable(),
+        _labels(),
+        MappingProxyType({"schema_version": 1}),
+    )
+    assert load_observable(observable_path).detector_bits.shape == (64, 3)
+
+
+def test_publish_resumes_only_an_identical_artifact_pair(
+    tmp_path: Path, tiny_job: TrajectoryJob
+) -> None:
+    first = publish_trajectory(tmp_path, tiny_job, _observable(), _labels(), {"schema_version": 1})
+    first_hashes = tuple(verify_artifact(path) for path in first)
+    second = publish_trajectory(tmp_path, tiny_job, _observable(), _labels(), {"schema_version": 1})
+    assert second == first
+    assert tuple(verify_artifact(path) for path in second) == first_hashes
+
+
+def test_publish_never_overwrites_conflicting_complete_artifact(
+    tmp_path: Path, tiny_job: TrajectoryJob
+) -> None:
+    observable = _observable()
+    labels = _labels()
+    publish_trajectory(tmp_path, tiny_job, observable, labels, {"schema_version": 1})
+    changed = replace(observable, detector_bits=~observable.detector_bits)
+    with pytest.raises(FileExistsError, match="artifact conflict"):
+        publish_trajectory(tmp_path, tiny_job, changed, labels, {"schema_version": 1})

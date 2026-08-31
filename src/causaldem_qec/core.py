@@ -8,7 +8,7 @@ from hashlib import sha256
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 
@@ -78,12 +78,137 @@ class TrajectoryJob:
 
 
 @dataclass(frozen=True, slots=True)
+class ObservableTrajectory:
+    detector_bits: np.ndarray
+    detector_valid: np.ndarray
+    logical_observable: np.ndarray
+    global_round: np.ndarray
+    episode: np.ndarray
+    round_in_episode: np.ndarray
+    block: np.ndarray
+    detector_role: np.ndarray
+    circuit_phase: np.ndarray
+    max_source_round: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class LabelTrajectory:
+    component_probability: np.ndarray
+    latent_factor: np.ndarray
+    class_probability: np.ndarray
+    future_block_probability: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
 class TrajectoryFailure:
     condition_id: str
     trajectory_id: int
     stage: str
     code: FailureCode
     message: str
+
+
+def _require_array(
+    value: np.ndarray, name: str, *, ndim: int, dtype: np.dtype[Any] | None = None
+) -> None:
+    if not isinstance(value, np.ndarray) or value.ndim != ndim:
+        raise ValueError(f"{name} must be a rank-{ndim} NumPy array")
+    if dtype is not None and value.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}")
+
+
+def _require_unsigned_index(value: np.ndarray, name: str, *, length: int | None = None) -> None:
+    _require_array(value, name, ndim=1)
+    if not np.issubdtype(value.dtype, np.unsignedinteger):
+        raise ValueError(f"{name} must have an unsigned integer dtype")
+    if length is not None and value.size != length:
+        raise ValueError(f"{name} must match the trajectory round count")
+
+
+def validate_observable(trajectory: ObservableTrajectory) -> None:
+    """Validate the detector-only artifact contract without mutating its arrays."""
+    _require_array(trajectory.detector_bits, "detector_bits", ndim=2, dtype=np.dtype(np.bool_))
+    _require_array(trajectory.detector_valid, "detector_valid", ndim=2, dtype=np.dtype(np.bool_))
+    if trajectory.detector_valid.shape != trajectory.detector_bits.shape:
+        raise ValueError("detector_valid must match detector_bits")
+    rounds, detectors = trajectory.detector_bits.shape
+    if rounds == 0 or detectors == 0:
+        raise ValueError("detector_bits must have nonzero round and detector dimensions")
+    _require_array(
+        trajectory.logical_observable, "logical_observable", ndim=1, dtype=np.dtype(np.bool_)
+    )
+    _require_unsigned_index(trajectory.global_round, "global_round", length=rounds)
+    _require_unsigned_index(trajectory.episode, "episode", length=rounds)
+    _require_unsigned_index(trajectory.round_in_episode, "round_in_episode", length=rounds)
+    _require_unsigned_index(trajectory.block, "block", length=rounds)
+    _require_unsigned_index(trajectory.detector_role, "detector_role")
+    _require_unsigned_index(trajectory.circuit_phase, "circuit_phase", length=rounds)
+    _require_array(
+        trajectory.max_source_round, "max_source_round", ndim=1, dtype=np.dtype(np.int64)
+    )
+    if trajectory.max_source_round.size != rounds:
+        raise ValueError("max_source_round must match the trajectory round count")
+    if trajectory.detector_role.size != detectors:
+        raise ValueError("detector_role must match the detector count")
+    if not np.all(np.diff(trajectory.global_round.astype(np.int64)) > 0):
+        raise ValueError("global_round must be strictly increasing")
+    if not np.all(np.diff(trajectory.episode.astype(np.int64)) >= 0):
+        raise ValueError("episode must be monotone")
+    if not np.all(np.diff(trajectory.block.astype(np.int64)) >= 0):
+        raise ValueError("block must be monotone")
+    if not np.all(np.diff(trajectory.max_source_round) >= 0):
+        raise ValueError("max_source_round must be monotone")
+    if np.any(trajectory.max_source_round > trajectory.global_round.astype(np.int64)):
+        raise ValueError("max_source_round cannot exceed global_round")
+    episode_count = np.unique(trajectory.episode).size
+    if trajectory.logical_observable.size != episode_count:
+        raise ValueError("logical_observable must contain one value per episode")
+
+
+def validate_labels(trajectory: LabelTrajectory) -> None:
+    """Validate offline-only simulator truth arrays without coercion or clipping."""
+    _require_array(
+        trajectory.component_probability,
+        "component_probability",
+        ndim=2,
+        dtype=np.dtype(np.float64),
+    )
+    _require_array(trajectory.latent_factor, "latent_factor", ndim=2, dtype=np.dtype(np.float64))
+    _require_array(
+        trajectory.class_probability, "class_probability", ndim=2, dtype=np.dtype(np.float64)
+    )
+    _require_array(
+        trajectory.future_block_probability,
+        "future_block_probability",
+        ndim=2,
+        dtype=np.dtype(np.float64),
+    )
+    rounds = trajectory.component_probability.shape[0]
+    if rounds == 0:
+        raise ValueError("component_probability must contain at least one round")
+    if (
+        trajectory.latent_factor.shape[0] != rounds
+        or trajectory.class_probability.shape[0] != rounds
+    ):
+        raise ValueError("label arrays must agree on their round count")
+    classes = trajectory.class_probability.shape[1]
+    if classes == 0 or trajectory.future_block_probability.shape[1] != classes:
+        raise ValueError("class probability arrays must agree on their class count")
+    for name, value in (
+        ("component_probability", trajectory.component_probability),
+        ("latent_factor", trajectory.latent_factor),
+        ("class_probability", trajectory.class_probability),
+        ("future_block_probability", trajectory.future_block_probability),
+    ):
+        if not np.isfinite(value).all():
+            raise ValueError(f"{name} must be finite")
+    for name, value in (
+        ("component_probability", trajectory.component_probability),
+        ("class_probability", trajectory.class_probability),
+        ("future_block_probability", trajectory.future_block_probability),
+    ):
+        if np.any((value < 0.0) | (value >= 0.5)):
+            raise ValueError(f"{name} values must be inside [0, 0.5)")
 
 
 @dataclass(frozen=True, slots=True)
