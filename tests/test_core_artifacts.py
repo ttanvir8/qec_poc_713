@@ -1,4 +1,5 @@
 import json
+import shutil
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
@@ -6,6 +7,7 @@ from types import MappingProxyType
 import numpy as np
 import pytest
 
+import causaldem_qec.artifacts as artifact_module
 from causaldem_qec.artifacts import (
     load_labels,
     load_observable,
@@ -202,7 +204,31 @@ def test_loader_rejects_a_checksum_corrupted_artifact(
 
 def test_validation_accepts_a_chunk_with_absolute_episode_numbers() -> None:
     observable = _observable()
-    validate_observable(replace(observable, episode=observable.episode + np.uint32(16)))
+    validate_observable(
+        replace(
+            observable,
+            global_round=observable.global_round + np.uint32(512),
+            episode=observable.episode + np.uint32(16),
+            block=observable.block + np.uint32(2),
+            max_source_round=observable.max_source_round + 512,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("global_round", np.array([0, 1, *range(3, 65)], dtype=np.uint32)),
+        ("round_in_episode", np.arange(1, 65, dtype=np.uint32) % 32),
+        ("episode", np.arange(64, dtype=np.uint32) // 16),
+        ("block", np.ones(64, dtype=np.uint32)),
+    ],
+)
+def test_validation_rejects_clock_inconsistent_chronology(
+    field: str, replacement: np.ndarray
+) -> None:
+    with pytest.raises(ValueError, match="clock"):
+        validate_observable(replace(_observable(), **{field: replacement}))
 
 
 def test_publish_rejects_labels_with_a_different_round_count(
@@ -225,6 +251,50 @@ def test_publish_accepts_the_mapping_contract_for_metadata(
         MappingProxyType({"schema_version": 1}),
     )
     assert load_observable(observable_path).detector_bits.shape == (64, 3)
+
+
+def test_publish_rejects_raw_private_seed_metadata(tmp_path: Path, tiny_job: TrajectoryJob) -> None:
+    with pytest.raises(ValueError, match="raw seed"):
+        publish_trajectory(
+            tmp_path,
+            tiny_job,
+            _observable(),
+            _labels(),
+            {"schema_version": 1, "private_seed": 713},
+        )
+    assert not (tmp_path / "data").exists()
+
+
+def test_publish_removes_first_lane_when_label_publication_fails(
+    tmp_path: Path, tiny_job: TrajectoryJob, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observable_path = (
+        tmp_path / "data" / "observable" / tiny_job.split / tiny_job.condition_id / "0"
+    )
+    label_path = tmp_path / "data" / "labels" / tiny_job.split / tiny_job.condition_id / "0"
+    original_replace = artifact_module.os.replace
+
+    def fail_label_publish(source: Path, target: Path) -> None:
+        if target == label_path:
+            raise OSError("simulated label publication failure")
+        original_replace(source, target)
+
+    monkeypatch.setattr(artifact_module.os, "replace", fail_label_publish)
+    with pytest.raises(OSError, match="label publication failure"):
+        publish_trajectory(tmp_path, tiny_job, _observable(), _labels(), {"schema_version": 1})
+    assert not observable_path.exists()
+    assert not label_path.exists()
+
+
+def test_publish_rejects_an_existing_one_lane_artifact_pair(
+    tmp_path: Path, tiny_job: TrajectoryJob
+) -> None:
+    _, label_path = publish_trajectory(
+        tmp_path, tiny_job, _observable(), _labels(), {"schema_version": 1}
+    )
+    shutil.rmtree(label_path)
+    with pytest.raises(ValueError, match="incomplete artifact pair"):
+        publish_trajectory(tmp_path, tiny_job, _observable(), _labels(), {"schema_version": 1})
 
 
 def test_publish_resumes_only_an_identical_artifact_pair(

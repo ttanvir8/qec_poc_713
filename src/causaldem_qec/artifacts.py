@@ -135,6 +135,18 @@ def _pair_id(job: TrajectoryJob, metadata: Mapping[str, object]) -> str:
     ).hexdigest()
 
 
+def _reject_raw_seed_metadata(value: object) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            normalized = str(key).lower().replace("-", "_")
+            if "seed" in normalized and "commitment" not in normalized and "hash" not in normalized:
+                raise ValueError("public metadata must not contain a raw seed")
+            _reject_raw_seed_metadata(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_raw_seed_metadata(item)
+
+
 def _staging_directory(target: Path) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
@@ -186,6 +198,29 @@ def _write_lane(
     )
 
 
+def _existing_artifact_hash(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    return verify_artifact(path)
+
+
+def _preflight_pair(
+    observable_path: Path,
+    label_path: Path,
+    observable_hash: str,
+    label_hash: str,
+) -> bool:
+    existing_observable = _existing_artifact_hash(observable_path)
+    existing_labels = _existing_artifact_hash(label_path)
+    if (existing_observable is None) != (existing_labels is None):
+        raise ValueError("incomplete artifact pair")
+    if existing_observable is None:
+        return False
+    if existing_observable != observable_hash or existing_labels != label_hash:
+        raise FileExistsError(f"artifact conflict: {observable_path}")
+    return True
+
+
 def publish_trajectory(
     root: Path,
     job: TrajectoryJob,
@@ -198,6 +233,7 @@ def publish_trajectory(
     validate_labels(labels)
     if labels.component_probability.shape[0] != observable.detector_bits.shape[0]:
         raise ValueError("label rounds must match observable rounds")
+    _reject_raw_seed_metadata(metadata)
     observable_path = (
         root / "data" / "observable" / job.split / job.condition_id / str(job.trajectory_id)
     )
@@ -222,12 +258,23 @@ def publish_trajectory(
             pair_id=pair_id,
             arrays=_label_arrays(labels),
         )
-        _write_sums(observable_staging)
-        _write_sums(label_staging)
-        verify_artifact(observable_staging)
-        verify_artifact(label_staging)
+        observable_hash = _write_sums(observable_staging)
+        label_hash = _write_sums(label_staging)
+        if verify_artifact(observable_staging) != observable_hash:
+            raise ValueError("observable staging checksum mismatch")
+        if verify_artifact(label_staging) != label_hash:
+            raise ValueError("label staging checksum mismatch")
+        if _preflight_pair(observable_path, label_path, observable_hash, label_hash):
+            shutil.rmtree(observable_staging)
+            shutil.rmtree(label_staging)
+            return observable_path, label_path
         _publish_directory(observable_staging, observable_path)
-        _publish_directory(label_staging, label_path)
+        try:
+            _publish_directory(label_staging, label_path)
+        except BaseException:
+            if observable_path.exists() and verify_artifact(observable_path) == observable_hash:
+                shutil.rmtree(observable_path)
+            raise
     except BaseException:
         if observable_staging.exists():
             shutil.rmtree(observable_staging)

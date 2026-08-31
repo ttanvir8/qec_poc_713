@@ -48,6 +48,8 @@ _COMPONENT_IDS = frozenset(
         "surface_correlated",
     }
 )
+_EPISODE_ROUNDS = 32
+_BLOCK_ROUNDS = 256
 
 
 class FailureCode(StrEnum):
@@ -117,10 +119,10 @@ def _require_array(
         raise ValueError(f"{name} must have dtype {dtype}")
 
 
-def _require_unsigned_index(value: np.ndarray, name: str, *, length: int | None = None) -> None:
-    _require_array(value, name, ndim=1)
-    if not np.issubdtype(value.dtype, np.unsignedinteger):
-        raise ValueError(f"{name} must have an unsigned integer dtype")
+def _require_unsigned_index(
+    value: np.ndarray, name: str, *, dtype: np.dtype[Any], length: int | None = None
+) -> None:
+    _require_array(value, name, ndim=1, dtype=dtype)
     if length is not None and value.size != length:
         raise ValueError(f"{name} must match the trajectory round count")
 
@@ -137,12 +139,21 @@ def validate_observable(trajectory: ObservableTrajectory) -> None:
     _require_array(
         trajectory.logical_observable, "logical_observable", ndim=1, dtype=np.dtype(np.bool_)
     )
-    _require_unsigned_index(trajectory.global_round, "global_round", length=rounds)
-    _require_unsigned_index(trajectory.episode, "episode", length=rounds)
-    _require_unsigned_index(trajectory.round_in_episode, "round_in_episode", length=rounds)
-    _require_unsigned_index(trajectory.block, "block", length=rounds)
-    _require_unsigned_index(trajectory.detector_role, "detector_role")
-    _require_unsigned_index(trajectory.circuit_phase, "circuit_phase", length=rounds)
+    _require_unsigned_index(
+        trajectory.global_round, "global_round", dtype=np.dtype(np.uint32), length=rounds
+    )
+    _require_unsigned_index(trajectory.episode, "episode", dtype=np.dtype(np.uint32), length=rounds)
+    _require_unsigned_index(
+        trajectory.round_in_episode,
+        "round_in_episode",
+        dtype=np.dtype(np.uint32),
+        length=rounds,
+    )
+    _require_unsigned_index(trajectory.block, "block", dtype=np.dtype(np.uint32), length=rounds)
+    _require_unsigned_index(trajectory.detector_role, "detector_role", dtype=np.dtype(np.uint16))
+    _require_unsigned_index(
+        trajectory.circuit_phase, "circuit_phase", dtype=np.dtype(np.uint8), length=rounds
+    )
     _require_array(
         trajectory.max_source_round, "max_source_round", ndim=1, dtype=np.dtype(np.int64)
     )
@@ -150,15 +161,18 @@ def validate_observable(trajectory: ObservableTrajectory) -> None:
         raise ValueError("max_source_round must match the trajectory round count")
     if trajectory.detector_role.size != detectors:
         raise ValueError("detector_role must match the detector count")
-    if not np.all(np.diff(trajectory.global_round.astype(np.int64)) > 0):
-        raise ValueError("global_round must be strictly increasing")
-    if not np.all(np.diff(trajectory.episode.astype(np.int64)) >= 0):
-        raise ValueError("episode must be monotone")
-    if not np.all(np.diff(trajectory.block.astype(np.int64)) >= 0):
-        raise ValueError("block must be monotone")
+    global_round = trajectory.global_round.astype(np.int64)
+    if not np.all(np.diff(global_round) == 1):
+        raise ValueError("global_round must be consecutive clock rounds")
+    if not np.array_equal(trajectory.round_in_episode, trajectory.global_round % _EPISODE_ROUNDS):
+        raise ValueError("round_in_episode must agree with the global clock")
+    if not np.array_equal(trajectory.episode, trajectory.global_round // _EPISODE_ROUNDS):
+        raise ValueError("episode must agree with the global clock")
+    if not np.array_equal(trajectory.block, trajectory.global_round // _BLOCK_ROUNDS):
+        raise ValueError("block must agree with the global clock")
     if not np.all(np.diff(trajectory.max_source_round) >= 0):
         raise ValueError("max_source_round must be monotone")
-    if np.any(trajectory.max_source_round > trajectory.global_round.astype(np.int64)):
+    if np.any(trajectory.max_source_round > global_round):
         raise ValueError("max_source_round cannot exceed global_round")
     episode_count = np.unique(trajectory.episode).size
     if trajectory.logical_observable.size != episode_count:
