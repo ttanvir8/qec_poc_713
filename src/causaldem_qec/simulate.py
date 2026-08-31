@@ -71,6 +71,7 @@ NOISE_KIND = {
     "measure_z_basis": ("X_ERROR", "surface_measure"),
     "measure_x_basis": ("Z_ERROR", "surface_measure"),
     "correlated_pair": ("CORRELATED_ERROR", "surface_correlated"),
+    "surface_data_idle": ("DEPOLARIZE1", "surface_1q"),
     "repetition_data": ("DEPOLARIZE1", "repetition_data"),
     "repetition_measure": ("X_ERROR", "repetition_measure"),
 }
@@ -91,6 +92,8 @@ def bounded_probability(latent: np.ndarray, lower: np.ndarray, upper: np.ndarray
     probability = np.asarray(lower + (upper - lower) * expit(latent), dtype=np.float64)
     if not np.isfinite(probability).all():
         raise ValueError("nonfinite physical path")
+    if np.any(probability <= lower) or np.any(probability >= upper):
+        raise ValueError("saturated bounded transform")
     return probability
 
 
@@ -124,28 +127,73 @@ def _component_operations(circuit: CircuitSpec, instruction: stim.CircuitInstruc
     return ()
 
 
-def component_layout(circuit: CircuitSpec) -> tuple[PhysicalComponent, ...]:
+def _data_qubits(template: stim.Circuit) -> frozenset[int]:
+    values = {
+        target.qubit_value
+        for instruction in template
+        if instruction.name == "M"
+        for target in instruction.targets_copy()
+    }
+    if not values:
+        raise InvalidCircuit("memory template has no final data measurement")
+    return frozenset(values)
+
+
+def _component_sites(circuit: CircuitSpec) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    template = _template(circuit)
+    data_qubits = _data_qubits(template)
+    active_data: set[int] = set()
+    sites: list[tuple[str, tuple[int, ...]]] = []
+    for instruction in template:
+        targets = instruction.targets_copy()
+        target_values = _target_values(targets)
+        if circuit.family == "surface" and instruction.name == "TICK":
+            idle = tuple(sorted(data_qubits - active_data))
+            if idle:
+                sites.append(("surface_data_idle", idle))
+            active_data.clear()
+            continue
+        for kind in _component_operations(circuit, instruction):
+            if circuit.family == "repetition" and kind == "repetition_data":
+                target_values = tuple(target for target in target_values if target in data_qubits)
+            sites.append((kind, target_values))
+        if circuit.family == "surface":
+            active_data.update(target for target in target_values if target in data_qubits)
+    return tuple(sites)
+
+
+def _layout_bounds(
+    spec: PocSpec | None, bound_kind: str
+) -> tuple[float, float]:
+    if spec is not None:
+        return spec.component_bounds[bound_kind]
+    # The public layout has no PocSpec argument; generation always supplies it.
+    return {
+        "repetition_data": (0.0001, 0.03),
+        "repetition_measure": (0.0001, 0.05),
+        "surface_1q": (0.00001, 0.01),
+        "surface_2q": (0.00001, 0.02),
+        "surface_reset": (0.00001, 0.02),
+        "surface_measure": (0.00001, 0.03),
+        "surface_correlated": (0.000001, 0.005),
+    }[bound_kind]
+
+
+def component_layout(
+    circuit: CircuitSpec, spec: PocSpec | None = None
+) -> tuple[PhysicalComponent, ...]:
     """Fix each circuit operation location to one heterogeneous physical-rate column."""
     components: list[PhysicalComponent] = []
     seen: set[tuple[str, tuple[int, ...]]] = set()
-    for instruction in _template(circuit):
-        targets = _target_values(instruction.targets_copy())
-        for kind in _component_operations(circuit, instruction):
-            key = kind, targets
-            if key in seen:
-                continue
-            seen.add(key)
-            bound_kind = NOISE_KIND[kind][1]
-            bounds = {
-                "repetition_data": (0.0001, 0.03),
-                "repetition_measure": (0.0001, 0.05),
-                "surface_1q": (0.00001, 0.01),
-                "surface_2q": (0.00001, 0.02),
-                "surface_reset": (0.00001, 0.02),
-                "surface_measure": (0.00001, 0.03),
-                "surface_correlated": (0.000001, 0.005),
-            }[bound_kind]
-            components.append(PhysicalComponent(len(components), kind, targets, *bounds))
+    for kind, targets in _component_sites(circuit):
+        key = kind, targets
+        if key in seen:
+            continue
+        seen.add(key)
+        bound_kind = NOISE_KIND[kind][1]
+        components.append(
+            PhysicalComponent(len(components), kind, targets, *_layout_bounds(spec, bound_kind))
+        )
     if not components:
         raise InvalidCircuit(f"no physical components in {circuit.circuit_id}")
     return tuple(components)
@@ -240,6 +288,22 @@ def _geometric_run_mask(
     return mask
 
 
+def _canonical_component_pairs(components: tuple[PhysicalComponent, ...]) -> tuple[tuple[int, int], ...]:
+    by_type: dict[str, list[PhysicalComponent]] = {}
+    for component in components:
+        by_type.setdefault(NOISE_KIND[component.kind][1], []).append(component)
+    pairs: list[tuple[int, int]] = []
+    for physical_type in sorted(by_type):
+        motifs = sorted(by_type[physical_type], key=lambda item: (item.targets, item.component_id))
+        if len(motifs) % 2:
+            raise InvalidPhysicalPath(f"unmatched f14 component layout for {physical_type}")
+        pairs.extend(
+            (motifs[index].component_id, motifs[index + 1].component_id)
+            for index in range(0, len(motifs), 2)
+        )
+    return tuple(pairs)
+
+
 def generate_dynamics(
     spec: PocSpec,
     job: TrajectoryJob,
@@ -250,7 +314,7 @@ def generate_dynamics(
     discarded = spec.burn_in_rounds if burn_in is None else burn_in
     if scored <= 0 or discarded < 0:
         raise InvalidPhysicalPath("round counts must be positive after burn-in")
-    components = component_layout(job.circuit)
+    components = component_layout(job.circuit, spec)
     lower = np.asarray([component.lower for component in components], dtype=np.float64)
     upper = np.asarray([component.upper for component in components], dtype=np.float64)
     total = scored + discarded
@@ -284,17 +348,19 @@ def generate_dynamics(
             )
             phase = dynamics_rng.uniform(0.0, 2.0 * np.pi)
             chirp = np.sin(2.0 * np.pi * np.cumsum(1.0 / periods) + phase)
-            geometry = np.linspace(-1.0, 1.0, len(components), dtype=np.float64)
-            all_latent = _config_float(spec, "f06", "amplitude") * chirp[:, None] * (1.0 + 0.2 * geometry)
+            all_latent = _config_float(spec, "f06", "amplitude") * chirp[:, None]
             all_factors = np.column_stack((chirp, np.cos(2.0 * np.pi * np.cumsum(1.0 / periods) + phase)))
         case "f14_positive" | "f14_negative":
             config = spec.dynamics[job.dynamics_id]
-            pair_count = (len(components) + 1) // 2
+            pairs = _canonical_component_pairs(components)
+            pair_count = len(pairs)
             driver = stationary_ar1(_number(config["phi"], "f14.phi"), (total, pair_count), dynamics_rng)
             sign = _number(config["sign"], "f14.sign")
-            pair_driver = driver[:, np.arange(len(components)) // 2]
-            pair_sign = np.where(np.arange(len(components)) % 2 == 0, 1.0, sign)
-            all_latent = _number(config["amplitude"], "f14.amplitude") * pair_driver * pair_sign
+            all_latent = np.empty((total, len(components)), dtype=np.float64)
+            amplitude = _number(config["amplitude"], "f14.amplitude")
+            for pair_index, (first, second) in enumerate(pairs):
+                all_latent[:, first] = amplitude * driver[:, pair_index]
+                all_latent[:, second] = amplitude * sign * driver[:, pair_index]
             all_factors = np.column_stack((driver[:, 0], sign * driver[:, 0]))
         case _:
             raise InvalidPhysicalPath(f"unknown dynamics family {job.dynamics_id}")
@@ -317,6 +383,13 @@ def generate_dynamics(
     if job.dynamics_id == "f08":
         flip_probability = _config_float(spec, "f08", "flip_probability")
         contamination = True
+    base_parameters: object = MappingProxyType({})
+    base = spec.dynamics[job.dynamics_id].get("base")
+    if isinstance(base, str):
+        base_parameters = spec.dynamics[base]
+    layout_commitment = sha256(
+        repr(tuple((item.kind, item.targets) for item in components)).encode("utf-8")
+    ).hexdigest()
     metadata: Mapping[str, object] = MappingProxyType(
         {
             "dynamics_id": job.dynamics_id,
@@ -324,6 +397,12 @@ def generate_dynamics(
             "burn_in_final_state": tuple(float(value) for value in all_latent[discarded - 1])
             if discarded
             else (),
+            "resolved_parameters": spec.dynamics[job.dynamics_id],
+            "base_parameters": base_parameters,
+            "component_layout_commitment": layout_commitment,
+            "component_bounds": tuple(
+                (NOISE_KIND[item.kind][1], item.lower, item.upper) for item in components
+            ),
         }
     )
     return PhysicalNoisePath(
@@ -364,26 +443,12 @@ def _detector_metadata(circuit: stim.Circuit) -> tuple[np.ndarray, np.ndarray, n
         per_round[round_index] = role + 1
         rounds.append(round_index)
         roles.append(role)
-        phases.append(1 if round_index == 31 else 0)
+        phases.append(int(coordinates[-1]))
     return (
         np.asarray(rounds, dtype=np.uint8),
         np.asarray(roles, dtype=np.uint16),
         np.asarray(phases, dtype=np.uint8),
     )
-
-
-def _round_ranges(template: stim.Circuit) -> tuple[tuple[int, int], ...]:
-    starts = [0]
-    ranges: list[tuple[int, int]] = []
-    for index, instruction in enumerate(template):
-        if instruction.name == "MR":
-            ranges.append((starts[-1], index + 1))
-            starts.append(index + 1)
-    if len(ranges) != 32:
-        raise InvalidCircuit("memory template must contain 32 syndrome rounds")
-    last_start, _ = ranges[-1]
-    ranges[-1] = last_start, len(list(template))
-    return tuple(ranges)
 
 
 def build_memory_episode(
@@ -398,10 +463,32 @@ def build_memory_episode(
     result = stim.Circuit()
     current_round = 0
     template = _template(circuit)
+    data_qubits = _data_qubits(template)
+    active_data: set[int] = set()
+    range_start = 0
+    round_ranges: list[tuple[int, int]] = []
     for instruction in template:
         targets = instruction.targets_copy()
         target_key = _target_values(targets)
+        if circuit.family == "surface" and instruction.name == "TICK":
+            _append_instruction(result, instruction)
+            idle = tuple(sorted(data_qubits - active_data))
+            if idle:
+                column = lookup[("surface_data_idle", idle)]
+                append_noise(
+                    result,
+                    NOISE_KIND["surface_data_idle"][0],
+                    [stim.GateTarget(target) for target in idle],
+                    float(round_probability[min(current_round, 31), column]),
+                )
+            active_data.clear()
+            continue
         kinds = _component_operations(circuit, instruction)
+        noise_targets = targets
+        noise_target_key = target_key
+        if circuit.family == "repetition" and instruction.name == "CX":
+            noise_targets = [target for target in targets if target.qubit_value in data_qubits]
+            noise_target_key = _target_values(noise_targets)
         if instruction.name in {"MR", "M"}:
             measurement_kind = (
                 "repetition_measure" if circuit.family == "repetition" else "measure_z_basis"
@@ -424,24 +511,35 @@ def build_memory_episode(
                 pass
             elif (circuit.family == "repetition" and instruction.name in {"MR", "M"}) or not kinds:
                 continue
-            column = lookup[(kind, target_key)]
+            column = lookup[(kind, noise_target_key)]
             noise_name = NOISE_KIND[kind][0]
             probability = float(round_probability[min(current_round, 31), column])
             if kind == "correlated_pair":
-                if len(targets) < 2:
+                if len(noise_targets) < 2 or len(noise_targets) % 2:
                     raise InvalidCircuit("correlated pair requires two qubits")
-                append_noise(
-                    result,
-                    noise_name,
-                    [stim.target_x(targets[0].qubit_value), stim.target_x(targets[1].qubit_value)],
-                    probability,
-                )
+                for pair_start in range(0, len(noise_targets), 2):
+                    append_noise(
+                        result,
+                        noise_name,
+                        [
+                            stim.target_x(noise_targets[pair_start].qubit_value),
+                            stim.target_x(noise_targets[pair_start + 1].qubit_value),
+                        ],
+                        probability,
+                    )
             else:
-                append_noise(result, noise_name, targets, probability)
+                append_noise(result, noise_name, noise_targets, probability)
+        if circuit.family == "surface":
+            active_data.update(target for target in target_key if target in data_qubits)
         if instruction.name == "MR":
+            round_ranges.append((range_start, len(list(result))))
+            range_start = len(list(result))
             current_round += 1
     if current_round != 32 or "REPEAT" in str(result):
         raise InvalidCircuit("episode expansion did not fully unroll 32 rounds")
+    if len(round_ranges) != 32:
+        raise InvalidCircuit("episode is missing round instruction ranges")
+    round_ranges[-1] = (round_ranges[-1][0], len(list(result)))
     detector_round, detector_role, detector_phase = _detector_metadata(result)
     circuit_hash = sha256(str(result).encode("utf-8")).hexdigest()
     return BuiltEpisode(
@@ -449,7 +547,7 @@ def build_memory_episode(
         detector_round=detector_round,
         detector_role=detector_role,
         detector_phase=detector_phase,
-        round_instruction_ranges=_round_ranges(template),
+        round_instruction_ranges=tuple(round_ranges),
         circuit_hash=circuit_hash,
     )
 
@@ -530,5 +628,5 @@ def sample_trajectory(spec: PocSpec, job: TrajectoryJob, path: PhysicalNoisePath
         episode=global_round // np.uint32(32),
         round_in_episode=global_round % np.uint32(32),
         detector_role=np.arange(max_role, dtype=np.uint16),
-        circuit_phase=np.where(global_round % np.uint32(32) == 31, 1, 0).astype(np.uint8),
+        circuit_phase=(global_round % np.uint32(32)).astype(np.uint8),
     )
