@@ -181,6 +181,13 @@ def _list(value: object, name: str) -> list[object]:
     return value
 
 
+def _probability(value: object, name: str) -> float:
+    probability = _number(value, name, upper=1)
+    if probability < 0:
+        raise ValueError(f"{name} is outside its valid range")
+    return probability
+
+
 def _freeze(value: object) -> object:
     if isinstance(value, Mapping):
         return MappingProxyType({str(key): _freeze(item) for key, item in value.items()})
@@ -250,16 +257,16 @@ def _validate_dynamics(dynamics: Mapping[str, object]) -> Mapping[str, Mapping[s
     if _string(f07["base"], "f07.base") != "f03":
         raise ValueError("f07.base must be f03")
     for key in ("mcar", "burst_hazard", "detector_fraction"):
-        _number(f07[key], f"f07.{key}", lower=-1, upper=1)
+        _probability(f07[key], f"f07.{key}")
     _integer(f07["mean_duration"], "f07.mean_duration")
     f08 = _mapping(dynamics["f08"], "dynamics.f08")
     if _string(f08["base"], "f08.base") != "f03":
         raise ValueError("f08.base must be f03")
-    _number(f08["flip_probability"], "f08.flip_probability", lower=-1, upper=1)
+    _probability(f08["flip_probability"], "f08.flip_probability")
     f12 = _mapping(dynamics["f12"], "dynamics.f12")
     if _string(f12["base"], "f12.base") != "f03":
         raise ValueError("f12.base must be f03")
-    _number(f12["onset_hazard"], "f12.onset_hazard", lower=-1, upper=1)
+    _probability(f12["onset_hazard"], "f12.onset_hazard")
     _integer(f12["mean_duration"], "f12.mean_duration")
     _number(f12["amplitude"], "f12.amplitude", lower=0)
     for dynamics_id, expected_sign in (("f14_positive", 1), ("f14_negative", -1)):
@@ -297,8 +304,8 @@ def load_spec(path: Path) -> PocSpec:
     scored_rounds = _integer(rounds["scored"], "rounds.scored")
     episode_rounds = _integer(rounds["episode"], "rounds.episode")
     block_rounds = _integer(rounds["block"], "rounds.block")
-    if scored_rounds % episode_rounds or scored_rounds % block_rounds:
-        raise ValueError("scored rounds must divide exactly into episodes and blocks")
+    if (burn_in_rounds, scored_rounds, episode_rounds, block_rounds) != (4096, 65536, 32, 256):
+        raise ValueError("rounds must match the committed trajectory fidelity")
 
     circuits_config = _mapping(config["circuits"], "circuits")
     _exact_keys(circuits_config, _CIRCUIT_IDS, "circuits")
@@ -425,6 +432,8 @@ def load_spec(path: Path) -> PocSpec:
     runtime = _mapping(config["runtime"], "runtime")
     _exact_keys(runtime, frozenset({"retry_attempts", "chunk_rounds"}), "runtime")
     retry_attempts = _integer(runtime["retry_attempts"], "runtime.retry_attempts")
+    if retry_attempts > 3:
+        raise ValueError("retry_attempts must not exceed 3")
     chunk_rounds = _integer(runtime["chunk_rounds"], "runtime.chunk_rounds")
 
     roots_config = _mapping(config["roots"], "roots")
