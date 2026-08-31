@@ -27,6 +27,7 @@ from causaldem_qec.core import (
 
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
 
 
 def _json_value(value: object) -> object:
@@ -109,7 +110,7 @@ def verify_artifact(path: Path) -> str:
     return hashlib.sha256(sums.encode("ascii")).hexdigest()
 
 
-def _rename_no_replace(source: Path, target: Path) -> None:
+def _rename_with_flags(source: Path, target: Path, flags: int) -> None:
     try:
         renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
     except AttributeError as error:
@@ -128,7 +129,7 @@ def _rename_no_replace(source: Path, target: Path) -> None:
             os.fsencode(source),
             _AT_FDCWD,
             os.fsencode(target),
-            _RENAME_NOREPLACE,
+            flags,
         )
         != 0
     ):
@@ -136,16 +137,30 @@ def _rename_no_replace(source: Path, target: Path) -> None:
         raise OSError(error_number, os.strerror(error_number), target)
 
 
-def _publish_directory(staging: Path, target: Path) -> tuple[str, bool]:
+def _rename_no_replace(source: Path, target: Path) -> None:
+    _rename_with_flags(source, target, _RENAME_NOREPLACE)
+
+
+def _rename_exchange(source: Path, target: Path) -> None:
+    _rename_with_flags(source, target, _RENAME_EXCHANGE)
+
+
+def _directory_identity(path: Path) -> tuple[int, int]:
+    status = path.stat(follow_symlinks=False)
+    return status.st_dev, status.st_ino
+
+
+def _publish_directory(staging: Path, target: Path) -> tuple[str, tuple[int, int] | None]:
     artifact_hash = _write_sums(staging)
+    staging_identity = _directory_identity(staging)
     try:
         _rename_no_replace(staging, target)
     except FileExistsError:
         if verify_artifact(target) == artifact_hash:
             shutil.rmtree(staging)
-            return artifact_hash, False
+            return artifact_hash, None
         raise FileExistsError(f"artifact conflict: {target}")
-    return artifact_hash, True
+    return artifact_hash, staging_identity
 
 
 def _job_metadata(job: TrajectoryJob) -> dict[str, object]:
@@ -271,18 +286,47 @@ def _preflight_pair(
     return True
 
 
-def _remove_owned_artifact(path: Path, artifact_hash: str) -> None:
+def _remove_owned_artifact(path: Path, artifact_hash: str, owned_identity: tuple[int, int]) -> None:
+    cleanup_path: Path | None = None
+    cleanup_identity: tuple[int, int] | None = None
     try:
         matches_owned_artifact = path.exists() and verify_artifact(path) == artifact_hash
-        if matches_owned_artifact:
-            shutil.rmtree(path)
+        if not matches_owned_artifact:
+            return
+        cleanup_path = Path(tempfile.mkdtemp(prefix=f".{path.name}.cleanup-", dir=path.parent))
+        cleanup_identity = _directory_identity(cleanup_path)
+        _rename_exchange(path, cleanup_path)
+        if _directory_identity(cleanup_path) != owned_identity:
+            if _directory_identity(path) == cleanup_identity:
+                _rename_exchange(path, cleanup_path)
+            return
+        try:
+            shutil.rmtree(cleanup_path)
+        except OSError:
+            if _directory_identity(path) == cleanup_identity:
+                _rename_exchange(path, cleanup_path)
+            return
+        _rename_no_replace(path, cleanup_path)
+        if _directory_identity(cleanup_path) != cleanup_identity:
+            _rename_no_replace(cleanup_path, path)
+            return
+        cleanup_path.rmdir()
     except (OSError, ValueError):
         return
-    if matches_owned_artifact:
-        try:
-            _fsync_directory(path.parent)
-        except OSError:
-            pass
+    finally:
+        if cleanup_path is not None:
+            try:
+                if (
+                    cleanup_identity is not None
+                    and _directory_identity(cleanup_path) == cleanup_identity
+                ):
+                    cleanup_path.rmdir()
+            except OSError:
+                pass
+    try:
+        _fsync_directory(path.parent)
+    except OSError:
+        pass
 
 
 def publish_trajectory(
@@ -305,8 +349,8 @@ def publish_trajectory(
     pair_id = _pair_id(job, metadata)
     observable_staging = _staging_directory(observable_path)
     label_staging = _staging_directory(label_path)
-    observable_created = False
-    label_created = False
+    observable_identity: tuple[int, int] | None = None
+    label_identity: tuple[int, int] | None = None
     try:
         _write_lane(
             observable_staging,
@@ -334,15 +378,15 @@ def publish_trajectory(
             shutil.rmtree(observable_staging)
             shutil.rmtree(label_staging)
             return observable_path, label_path
-        _, observable_created = _publish_directory(observable_staging, observable_path)
+        _, observable_identity = _publish_directory(observable_staging, observable_path)
         _fsync_directory(observable_path.parent)
-        _, label_created = _publish_directory(label_staging, label_path)
+        _, label_identity = _publish_directory(label_staging, label_path)
         _fsync_directory(label_path.parent)
     except BaseException:
-        if label_created:
-            _remove_owned_artifact(label_path, label_hash)
-        if observable_created:
-            _remove_owned_artifact(observable_path, observable_hash)
+        if label_identity is not None:
+            _remove_owned_artifact(label_path, label_hash, label_identity)
+        if observable_identity is not None:
+            _remove_owned_artifact(observable_path, observable_hash, observable_identity)
         if observable_staging.exists():
             shutil.rmtree(observable_staging)
         if label_staging.exists():
@@ -454,16 +498,16 @@ def write_weight_table(
 ) -> str:
     staging = _staging_directory(path)
     artifact_hash = ""
-    created = False
+    owned_identity: tuple[int, int] | None = None
     try:
         _write_deterministic_npz(staging / "arrays.npz", arrays)
         _write_json(staging / "metadata.json", dict(metadata))
-        artifact_hash, created = _publish_directory(staging, path)
+        artifact_hash, owned_identity = _publish_directory(staging, path)
         _fsync_directory(path.parent)
         return artifact_hash
     except BaseException:
-        if created:
-            _remove_owned_artifact(path, artifact_hash)
+        if owned_identity is not None:
+            _remove_owned_artifact(path, artifact_hash, owned_identity)
         if staging.exists():
             shutil.rmtree(staging)
         raise

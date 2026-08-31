@@ -399,6 +399,40 @@ def test_cleanup_continues_after_a_concurrent_label_corruption(
         verify_artifact(label_path)
 
 
+def test_cleanup_preserves_a_rival_replacing_an_owned_lane_after_verification(
+    tmp_path: Path, tiny_job: TrajectoryJob, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observable_path = (
+        tmp_path / "data" / "observable" / tiny_job.split / tiny_job.condition_id / "0"
+    )
+    label_path = tmp_path / "data" / "labels" / tiny_job.split / tiny_job.condition_id / "0"
+    displaced_owned_path = label_path.with_name("owned-label-displaced")
+    original_fsync = artifact_module._fsync_directory
+    original_verify = artifact_module.verify_artifact
+
+    def fail_post_label_sync(path: Path) -> None:
+        if path == label_path.parent:
+            raise OSError("simulated post-label failure")
+        original_fsync(path)
+
+    def replace_label_after_cleanup_verification(path: Path) -> str:
+        artifact_hash = original_verify(path)
+        if path == label_path:
+            path.rename(displaced_owned_path)
+            path.mkdir()
+            (path / "rival").write_text("preserve me", encoding="utf-8")
+        return artifact_hash
+
+    monkeypatch.setattr(artifact_module, "_fsync_directory", fail_post_label_sync)
+    monkeypatch.setattr(
+        artifact_module, "verify_artifact", replace_label_after_cleanup_verification
+    )
+    with pytest.raises(OSError, match="post-label failure"):
+        publish_trajectory(tmp_path, tiny_job, _observable(), _labels(), {"schema_version": 1})
+    assert not observable_path.exists()
+    assert (label_path / "rival").read_text(encoding="utf-8") == "preserve me"
+
+
 def test_cleanup_continues_after_a_label_removal_failure(
     tmp_path: Path, tiny_job: TrajectoryJob, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -415,7 +449,9 @@ def test_cleanup_continues_after_a_label_removal_failure(
         original_fsync(path)
 
     def fail_label_removal(path: Path, *args: object, **kwargs: object) -> None:
-        if path == label_path:
+        if path == label_path or (
+            path.parent == label_path.parent and path.name.startswith(".0.cleanup-")
+        ):
             raise OSError("simulated label removal failure")
         original_rmtree(path, *args, **kwargs)
 
