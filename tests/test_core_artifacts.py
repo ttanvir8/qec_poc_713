@@ -265,6 +265,96 @@ def test_publish_rejects_raw_private_seed_metadata(tmp_path: Path, tiny_job: Tra
     assert not (tmp_path / "data").exists()
 
 
+def test_publish_rejects_a_numeric_seed_hash_metadata_value(
+    tmp_path: Path, tiny_job: TrajectoryJob
+) -> None:
+    with pytest.raises(ValueError, match="raw seed"):
+        publish_trajectory(
+            tmp_path,
+            tiny_job,
+            _observable(),
+            _labels(),
+            {"schema_version": 1, "seed_hash": 713},
+        )
+
+
+def test_publish_accepts_a_sha256_seed_commitment_hash(
+    tmp_path: Path, tiny_job: TrajectoryJob
+) -> None:
+    observable_path, _ = publish_trajectory(
+        tmp_path,
+        tiny_job,
+        _observable(),
+        _labels(),
+        {"schema_version": 1, "seed_commitment_hash": "a" * 64},
+    )
+    assert load_observable(observable_path).detector_bits.shape == (64, 3)
+
+
+def test_publish_accepts_a_structured_sha256_seed_commitment(
+    tmp_path: Path, tiny_job: TrajectoryJob
+) -> None:
+    observable_path, _ = publish_trajectory(
+        tmp_path,
+        tiny_job,
+        _observable(),
+        _labels(),
+        {
+            "schema_version": 1,
+            "seed_commitment": {"algorithm": "sha256", "digest": "a" * 64},
+        },
+    )
+    assert load_observable(observable_path).detector_bits.shape == (64, 3)
+
+
+@pytest.mark.parametrize("lane", ["observable", "labels"])
+def test_publish_rolls_back_both_lanes_after_postrename_directory_sync_failure(
+    tmp_path: Path, tiny_job: TrajectoryJob, monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    observable_path = (
+        tmp_path / "data" / "observable" / tiny_job.split / tiny_job.condition_id / "0"
+    )
+    label_path = tmp_path / "data" / "labels" / tiny_job.split / tiny_job.condition_id / "0"
+    failed_parent = observable_path.parent if lane == "observable" else label_path.parent
+    original_fsync = artifact_module._fsync_directory
+
+    def fail_postrename_sync(path: Path) -> None:
+        if path == failed_parent:
+            raise OSError(f"simulated {lane} post-rename sync failure")
+        original_fsync(path)
+
+    monkeypatch.setattr(artifact_module, "_fsync_directory", fail_postrename_sync)
+    with pytest.raises(OSError, match="post-rename sync failure"):
+        publish_trajectory(tmp_path, tiny_job, _observable(), _labels(), {"schema_version": 1})
+    assert not observable_path.exists()
+    assert not label_path.exists()
+
+
+def test_publish_failure_preserves_a_concurrently_created_complete_pair(
+    tmp_path: Path, tiny_job: TrajectoryJob, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observable_path = (
+        tmp_path / "data" / "observable" / tiny_job.split / tiny_job.condition_id / "0"
+    )
+    label_path = tmp_path / "data" / "labels" / tiny_job.split / tiny_job.condition_id / "0"
+    original_publish = artifact_module._publish_directory
+
+    def simulate_concurrent_pair(staging: Path, target: Path) -> object:
+        if target == observable_path:
+            concurrent_label_staging = next(label_path.parent.glob(".*.staging-*"))
+            shutil.copytree(staging, observable_path)
+            shutil.copytree(concurrent_label_staging, label_path)
+        if target == label_path:
+            raise OSError("simulated concurrent label failure")
+        return original_publish(staging, target)
+
+    monkeypatch.setattr(artifact_module, "_publish_directory", simulate_concurrent_pair)
+    with pytest.raises(OSError, match="concurrent label failure"):
+        publish_trajectory(tmp_path, tiny_job, _observable(), _labels(), {"schema_version": 1})
+    assert verify_artifact(observable_path)
+    assert verify_artifact(label_path)
+
+
 def test_publish_removes_first_lane_when_label_publication_fails(
     tmp_path: Path, tiny_job: TrajectoryJob, monkeypatch: pytest.MonkeyPatch
 ) -> None:

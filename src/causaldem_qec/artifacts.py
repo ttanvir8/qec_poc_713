@@ -104,17 +104,16 @@ def verify_artifact(path: Path) -> str:
     return hashlib.sha256(sums.encode("ascii")).hexdigest()
 
 
-def _publish_directory(staging: Path, target: Path) -> str:
+def _publish_directory(staging: Path, target: Path) -> tuple[str, bool]:
     artifact_hash = _write_sums(staging)
     if target.exists():
         if verify_artifact(target) == artifact_hash:
             shutil.rmtree(staging)
-            return artifact_hash
+            return artifact_hash, False
         raise FileExistsError(f"artifact conflict: {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
     os.replace(staging, target)
-    _fsync_directory(target.parent)
-    return artifact_hash
+    return artifact_hash, True
 
 
 def _job_metadata(job: TrajectoryJob) -> dict[str, object]:
@@ -135,12 +134,31 @@ def _pair_id(job: TrajectoryJob, metadata: Mapping[str, object]) -> str:
     ).hexdigest()
 
 
+def _is_sha256_digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value.lower())
+    )
+
+
+def _is_sha256_commitment(value: object) -> bool:
+    if _is_sha256_digest(value):
+        return True
+    if not isinstance(value, Mapping):
+        return False
+    return value.get("algorithm") == "sha256" and _is_sha256_digest(value.get("digest"))
+
+
 def _reject_raw_seed_metadata(value: object) -> None:
     if isinstance(value, Mapping):
         for key, item in value.items():
             normalized = str(key).lower().replace("-", "_")
-            if "seed" in normalized and "commitment" not in normalized and "hash" not in normalized:
-                raise ValueError("public metadata must not contain a raw seed")
+            if "seed" in normalized:
+                if "hash" not in normalized and "commitment" not in normalized:
+                    raise ValueError("public metadata must not contain a raw seed")
+                if not _is_sha256_commitment(item):
+                    raise ValueError("public metadata must not contain a raw seed")
             _reject_raw_seed_metadata(item)
     elif isinstance(value, (list, tuple)):
         for item in value:
@@ -221,6 +239,15 @@ def _preflight_pair(
     return True
 
 
+def _remove_owned_artifact(path: Path, artifact_hash: str) -> None:
+    if path.exists() and verify_artifact(path) == artifact_hash:
+        shutil.rmtree(path)
+        try:
+            _fsync_directory(path.parent)
+        except OSError:
+            pass
+
+
 def publish_trajectory(
     root: Path,
     job: TrajectoryJob,
@@ -241,6 +268,8 @@ def publish_trajectory(
     pair_id = _pair_id(job, metadata)
     observable_staging = _staging_directory(observable_path)
     label_staging = _staging_directory(label_path)
+    observable_created = False
+    label_created = False
     try:
         _write_lane(
             observable_staging,
@@ -268,14 +297,15 @@ def publish_trajectory(
             shutil.rmtree(observable_staging)
             shutil.rmtree(label_staging)
             return observable_path, label_path
-        _publish_directory(observable_staging, observable_path)
-        try:
-            _publish_directory(label_staging, label_path)
-        except BaseException:
-            if observable_path.exists() and verify_artifact(observable_path) == observable_hash:
-                shutil.rmtree(observable_path)
-            raise
+        _, observable_created = _publish_directory(observable_staging, observable_path)
+        _fsync_directory(observable_path.parent)
+        _, label_created = _publish_directory(label_staging, label_path)
+        _fsync_directory(label_path.parent)
     except BaseException:
+        if label_created:
+            _remove_owned_artifact(label_path, label_hash)
+        if observable_created:
+            _remove_owned_artifact(observable_path, observable_hash)
         if observable_staging.exists():
             shutil.rmtree(observable_staging)
         if label_staging.exists():
@@ -386,11 +416,17 @@ def write_weight_table(
     path: Path, arrays: Mapping[str, np.ndarray], metadata: Mapping[str, object]
 ) -> str:
     staging = _staging_directory(path)
+    artifact_hash = ""
+    created = False
     try:
         _write_deterministic_npz(staging / "arrays.npz", arrays)
         _write_json(staging / "metadata.json", dict(metadata))
-        return _publish_directory(staging, path)
+        artifact_hash, created = _publish_directory(staging, path)
+        _fsync_directory(path.parent)
+        return artifact_hash
     except BaseException:
+        if created:
+            _remove_owned_artifact(path, artifact_hash)
         if staging.exists():
             shutil.rmtree(staging)
         raise
