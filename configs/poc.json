@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "public_root_seed": 713,
+  "sealed_commitment_path": "data/manifests/sealed_commitment.json",
+  "rounds": {"burn_in": 4096, "scored": 65536, "episode": 32, "block": 256},
+  "trajectories_per_condition": 64,
+  "circuits": {
+    "repetition_d3": {"family": "repetition", "distance": 3},
+    "repetition_d5": {"family": "repetition", "distance": 5},
+    "surface_d3": {"family": "surface", "distance": 3},
+    "surface_d5": {"family": "surface", "distance": 5}
+  },
+  "condition_sets": {
+    "distance_3": ["f01", "f02", "f03", "f06", "f07", "f08", "f12", "f14_positive", "f14_negative"],
+    "distance_5": ["f01", "f03", "f06", "f12", "f14_positive", "f14_negative"]
+  },
+  "component_bounds": {
+    "repetition_data": [0.0001, 0.03],
+    "repetition_measure": [0.0001, 0.05],
+    "surface_1q": [0.00001, 0.01],
+    "surface_2q": [0.00001, 0.02],
+    "surface_reset": [0.00001, 0.02],
+    "surface_measure": [0.00001, 0.03],
+    "surface_correlated": [0.000001, 0.005]
+  },
+  "dynamics": {
+    "f01": {"offset_sd": 0.35},
+    "f02": {"phi": 0.995, "loading": 0.35},
+    "f03": {
+      "shared_phi": [0.999, 0.995],
+      "local_phi": 0.98,
+      "local_sd": 0.25,
+      "global_loading": 0.6,
+      "x_loading": 0.4,
+      "type_sign": {
+        "repetition_data": 1,
+        "repetition_measure": -1,
+        "surface_1q": 1,
+        "surface_2q": 1,
+        "surface_reset": -1,
+        "surface_measure": -1,
+        "surface_correlated": 1
+      }
+    },
+    "f06": {"amplitude": 0.8, "start_period": 4096, "stop_period": 512},
+    "f07": {"base": "f03", "mcar": 0.05, "burst_hazard": 0.001953125, "mean_duration": 16, "detector_fraction": 0.25},
+    "f08": {"base": "f03", "flip_probability": 0.01},
+    "f12": {"base": "f03", "onset_hazard": 0.000244140625, "mean_duration": 128, "amplitude": 1.0},
+    "f14_positive": {"phi": 0.995, "amplitude": 0.6, "sign": 1},
+    "f14_negative": {"phi": 0.995, "amplitude": 0.6, "sign": -1}
+  },
+  "target": {"max_classes": 8, "max_queries": 16, "max_query_weight": 3, "max_lag": 1, "relative_singular_tolerance": 1e-8, "moment_floor": 0.05},
+  "fit": {"ewma": [0.01, 0.03, 0.1, 0.3], "ar_phi": [0.95, 0.98, 0.995, 0.999], "innovation_sd": [0.01, 0.03, 0.1], "damping": [1e-6, 0.0001, 0.01]},
+  "forecast": {"samples": 128, "reference_samples": 1024, "mean_tolerance": 0.001},
+  "evaluation": {"bootstrap_resamples": 2000, "interval": 0.95},
+  "runtime": {"retry_attempts": 3, "chunk_rounds": 4096},
+  "roots": {"data": "data", "runs": "runs", "reports": "reports"}
+}

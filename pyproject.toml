@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "causaldem-qec"
+version = "0.1.0"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "numpy>=2.1",
+  "scipy>=1.14",
+  "stim>=1.15",
+  "pymatching>=2.3",
+  "pyarrow>=17",
+  "matplotlib>=3.9",
+  "jupyter>=1.1",
+  "nbconvert>=7.16",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "ruff>=0.6", "mypy>=1.11"]
+
+[project.scripts]
+causaldem-poc = "causaldem_qec.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/causaldem_qec"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: deterministic Monte Carlo or end-to-end verification"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["causaldem_qec"]
