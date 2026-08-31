@@ -14,6 +14,7 @@ from scipy.special import expit  # type: ignore[import-untyped]
 from causaldem_qec.core import (
     CanonicalCatalog,
     CanonicalClass,
+    CanonicalDemTruth,
     CircuitSpec,
     PocSpec,
     TrajectoryJob,
@@ -235,12 +236,18 @@ def _catalog_from_events(
     adaptable_mass = sum(item.probability for item in classes if item.adaptable)
     ambiguous_mass = sum(item.probability for item in classes if len(item.logical_signatures) != 1)
     hyperedge_mass = sum(item.probability for item in classes if not item.graphlike)
+    unsupported_static_mass = sum(
+        xor_compose(np.asarray([member[0] for member in members], dtype=np.float64))
+        for members in groups.values()
+        if not all(member[2] for member in members)
+    )
     return CanonicalCatalog(
         classes=tuple(classes),
         graphlike_mass=graphlike_mass,
         adaptable_mass=adaptable_mass,
         ambiguous_logical_mass=ambiguous_mass,
         hyperedge_mass=hyperedge_mass,
+        unsupported_static_mass=unsupported_static_mass,
         catalog_hash=sha256(json.dumps(canonical, sort_keys=True).encode("utf-8")).hexdigest(),
     )
 
@@ -287,7 +294,9 @@ def _episode_layout(
     return detectors, tuple(spans)
 
 
-def canonicalize_dem(circuit: stim.Circuit, episode_map: Sequence[BuiltEpisode]) -> CanonicalCatalog:
+def _canonical_dem_events(
+    circuit: stim.Circuit, episode_map: Sequence[BuiltEpisode]
+) -> tuple[tuple[float, tuple[tuple[int, int, int], ...], tuple[int, ...], bool, int], ...]:
     """Compile and canonicalize an undecomposed trajectory DEM using physical source locations."""
     dem = circuit.detector_error_model(
         decompose_errors=False,
@@ -313,7 +322,7 @@ def canonicalize_dem(circuit: stim.Circuit, episode_map: Sequence[BuiltEpisode])
                 explanation_sources.setdefault((detector_targets, logical_targets), []).append(
                     frames[-1].instruction_offset
                 )
-    events: list[tuple[float, tuple[tuple[int, int, int], ...], tuple[int, ...], bool]] = []
+    events: list[tuple[float, tuple[tuple[int, int, int], ...], tuple[int, ...], bool, int]] = []
     for probability, detector_ids, observable_ids in _dem_errors(dem):
         if not detector_ids:
             continue
@@ -339,7 +348,7 @@ def canonicalize_dem(circuit: stim.Circuit, episode_map: Sequence[BuiltEpisode])
             signature = tuple(
                 sorted((detector_map[item][1], detector_map[item][2], detector_map[item][3]) for item in detector_ids)
             )
-            events.append((probability, signature, (), False))
+            events.append((probability, signature, (), False, -1))
             continue
         signature = tuple(
             sorted(
@@ -348,8 +357,39 @@ def canonicalize_dem(circuit: stim.Circuit, episode_map: Sequence[BuiltEpisode])
             )
         )
         logical = tuple(sorted(item - episode_index for item in observable_ids))
-        events.append((probability, signature, logical, True))
-    return _catalog_from_events(events)
+        events.append((probability, signature, logical, True, episode_index * 32 + source_round))
+    return tuple(events)
+
+
+def canonicalize_dem(circuit: stim.Circuit, episode_map: Sequence[BuiltEpisode]) -> CanonicalCatalog:
+    events = _canonical_dem_events(circuit, episode_map)
+    return _catalog_from_events(tuple(event[:4] for event in events))
+
+
+def canonicalize_dem_truth(
+    circuit: stim.Circuit, episode_map: Sequence[BuiltEpisode]
+) -> CanonicalDemTruth:
+    """Derive frozen round truth from the complete, undecomposed trajectory DEM."""
+    events = _canonical_dem_events(circuit, episode_map)
+    catalog = _catalog_from_events(tuple(event[:4] for event in events))
+    class_index = {item.detector_signature: item.class_id for item in catalog.classes}
+    probability = np.zeros((len(episode_map) * 32, len(catalog.classes)), dtype=np.float64)
+    by_round_class: dict[tuple[int, int], list[float]] = {}
+    for event_probability, signature, _, _, source_round in events:
+        if source_round >= 0:
+            by_round_class.setdefault((source_round, class_index[signature]), []).append(event_probability)
+    for (round_index, class_id), values in by_round_class.items():
+        probability[round_index, class_id] = xor_compose(np.asarray(values, dtype=np.float64))
+    dem = circuit.detector_error_model(
+        decompose_errors=False,
+        approximate_disjoint_errors=False,
+        flatten_loops=True,
+    )
+    return CanonicalDemTruth(
+        catalog=catalog,
+        class_probability=probability,
+        dem_hash=sha256(str(dem).encode("utf-8")).hexdigest(),
+    )
 
 
 def run_dataset_gates(context: AuditContext) -> tuple[GateResult, ...]:
@@ -378,6 +418,50 @@ def run_dataset_gates(context: AuditContext) -> tuple[GateResult, ...]:
     )
     by_id = {item.gate_id: item for item in results}
     return tuple(by_id[gate_id] for gate_id, _ in DATASET_GATES)
+
+
+def dataset_gates_complete(results: Sequence[GateResult]) -> bool:
+    """A verification gate is complete only when every registered audit passed."""
+    return len(results) == len(DATASET_GATES) and all(item.status is GateStatus.PASS for item in results)
+
+
+def stationary_stim_audit(circuit: stim.Circuit, shots: int, seed: int) -> tuple[float, float]:
+    """Return direct Stim detector rate and its prescribed binomial tolerance."""
+    if shots <= 0:
+        raise ValueError("shots must be positive")
+    samples = circuit.compile_detector_sampler(seed=seed).sample(shots=shots)
+    rate = float(np.mean(samples, dtype=np.float64))
+    return rate, float(3.0 * np.sqrt(rate * (1.0 - rate) / shots) + 1.0 / shots)
+
+
+def mann_whitney_auc(scores: np.ndarray, labels: np.ndarray) -> float:
+    """Compute a tie-aware rank AUC without a statistics-framework dependency."""
+    values = np.asarray(scores, dtype=np.float64)
+    onset = np.asarray(labels, dtype=np.bool_)
+    if values.ndim != 1 or onset.shape != values.shape or not onset.any() or onset.all():
+        raise ValueError("invalid onset score inputs")
+    order = np.argsort(values, kind="stable")
+    ranks = np.empty(values.size, dtype=np.float64)
+    cursor = 0
+    while cursor < values.size:
+        end = cursor + 1
+        while end < values.size and values[order[end]] == values[order[cursor]]:
+            end += 1
+        ranks[order[cursor:end]] = (cursor + end + 1.0) / 2.0
+        cursor = end
+    positives = int(onset.sum())
+    negatives = values.size - positives
+    return float((ranks[onset].sum() - positives * (positives + 1) / 2.0) / (positives * negatives))
+
+
+def onset_permutation_threshold(scores: np.ndarray, labels: np.ndarray, seed: int) -> float:
+    """Return the deterministic 99th-percentile null deviation from 256 permutations."""
+    rng = np.random.default_rng(seed)
+    onset = np.asarray(labels, dtype=np.bool_)
+    deviations = np.empty(256, dtype=np.float64)
+    for index in range(deviations.size):
+        deviations[index] = abs(mann_whitney_auc(scores, rng.permutation(onset)) - 0.5)
+    return float(np.quantile(deviations, 0.99, method="higher"))
 
 
 def _template(circuit: CircuitSpec) -> stim.Circuit:

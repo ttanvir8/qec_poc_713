@@ -13,8 +13,10 @@ from causaldem_qec.simulate import (
     AuditContext,
     GateStatus,
     bounded_probability,
+    canonicalize_dem_truth,
     canonicalize_test_dem,
     component_layout,
+    dataset_gates_complete,
     generate_dynamics,
     run_dataset_gates,
     xor_compose,
@@ -240,6 +242,7 @@ def test_all_twelve_quality_gates_are_named(auditable_tiny_trajectory: AuditCont
     assert [result.gate_id for result in results] == [f"DQ{i:02d}" for i in range(1, 13)]
     assert results[7].status is GateStatus.NOT_RUN
     assert all(result.status is GateStatus.PASS for index, result in enumerate(results) if index != 7)
+    assert not dataset_gates_complete(results)
 
 
 def test_wrong_codrift_sign_invalidates_condition(auditable_tiny_trajectory: AuditContext) -> None:
@@ -264,3 +267,19 @@ def test_pre_onset_feature_signal_fails_exogenous_burst_gate(
     result = run_dataset_gates(broken)[10]
     assert result.gate_id == "DQ11"
     assert result.status is GateStatus.FAIL
+
+
+def test_complete_trajectory_dem_truth_is_round_resolved_and_frozen(job_for_family) -> None:
+    circuit_spec = job_for_family("f03").circuit
+    rates = np.full((32, len(component_layout(circuit_spec))), 0.001, dtype=np.float64)
+    episodes = tuple(build_memory_episode(circuit_spec, rates, episode_id) for episode_id in range(2))
+    truth = canonicalize_dem_truth(sum((episode.circuit for episode in episodes), stim.Circuit()), episodes)
+    assert truth.class_probability.shape == (64, len(truth.catalog.classes))
+    assert np.any(truth.class_probability == 0.0)
+    assert truth.dem_hash
+    assert truth.catalog.catalog_hash
+
+
+def test_detectorless_dem_event_is_rejected() -> None:
+    with pytest.raises(ValueError, match="no detector support"):
+        canonicalize_test_dem(stim.DetectorErrorModel("error(0.01) L0"), detector_round={})

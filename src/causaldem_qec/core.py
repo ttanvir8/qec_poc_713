@@ -120,7 +120,15 @@ class CanonicalCatalog:
     adaptable_mass: float
     ambiguous_logical_mass: float
     hyperedge_mass: float
+    unsupported_static_mass: float
     catalog_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalDemTruth:
+    catalog: CanonicalCatalog
+    class_probability: np.ndarray
+    dem_hash: str
 
 
 @dataclass(frozen=True, slots=True)
