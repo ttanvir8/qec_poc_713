@@ -355,6 +355,78 @@ def test_publish_failure_preserves_a_concurrently_created_complete_pair(
     assert verify_artifact(label_path)
 
 
+def test_publish_never_overwrites_a_rival_created_at_the_no_replace_seam(
+    tmp_path: Path, tiny_job: TrajectoryJob, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observable_path = (
+        tmp_path / "data" / "observable" / tiny_job.split / tiny_job.condition_id / "0"
+    )
+
+    def create_rival_after_check(staging: Path, target: Path) -> None:
+        if target == observable_path:
+            target.mkdir()
+            (target / "rival").write_text("do not replace", encoding="utf-8")
+        raise FileExistsError(target)
+
+    monkeypatch.setattr(
+        artifact_module, "_rename_no_replace", create_rival_after_check, raising=False
+    )
+    with pytest.raises(ValueError, match="incomplete artifact"):
+        publish_trajectory(tmp_path, tiny_job, _observable(), _labels(), {"schema_version": 1})
+    assert (observable_path / "rival").read_text(encoding="utf-8") == "do not replace"
+
+
+def test_cleanup_continues_after_a_concurrent_label_corruption(
+    tmp_path: Path, tiny_job: TrajectoryJob, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observable_path = (
+        tmp_path / "data" / "observable" / tiny_job.split / tiny_job.condition_id / "0"
+    )
+    label_path = tmp_path / "data" / "labels" / tiny_job.split / tiny_job.condition_id / "0"
+    original_fsync = artifact_module._fsync_directory
+
+    def fail_after_corrupting_label(path: Path) -> None:
+        if path == label_path.parent:
+            (label_path / "arrays.npz").write_bytes(b"concurrent corruption")
+            raise OSError("simulated post-label failure")
+        original_fsync(path)
+
+    monkeypatch.setattr(artifact_module, "_fsync_directory", fail_after_corrupting_label)
+    with pytest.raises(OSError, match="post-label failure"):
+        publish_trajectory(tmp_path, tiny_job, _observable(), _labels(), {"schema_version": 1})
+    assert not observable_path.exists()
+    with pytest.raises(ValueError, match="artifact checksum mismatch"):
+        verify_artifact(label_path)
+
+
+def test_cleanup_continues_after_a_label_removal_failure(
+    tmp_path: Path, tiny_job: TrajectoryJob, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observable_path = (
+        tmp_path / "data" / "observable" / tiny_job.split / tiny_job.condition_id / "0"
+    )
+    label_path = tmp_path / "data" / "labels" / tiny_job.split / tiny_job.condition_id / "0"
+    original_fsync = artifact_module._fsync_directory
+    original_rmtree = artifact_module.shutil.rmtree
+
+    def fail_post_label_sync(path: Path) -> None:
+        if path == label_path.parent:
+            raise OSError("simulated post-label failure")
+        original_fsync(path)
+
+    def fail_label_removal(path: Path, *args: object, **kwargs: object) -> None:
+        if path == label_path:
+            raise OSError("simulated label removal failure")
+        original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(artifact_module, "_fsync_directory", fail_post_label_sync)
+    monkeypatch.setattr(artifact_module.shutil, "rmtree", fail_label_removal)
+    with pytest.raises(OSError, match="post-label failure"):
+        publish_trajectory(tmp_path, tiny_job, _observable(), _labels(), {"schema_version": 1})
+    assert not observable_path.exists()
+    assert label_path.exists()
+
+
 def test_publish_removes_first_lane_when_label_publication_fails(
     tmp_path: Path, tiny_job: TrajectoryJob, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -362,14 +434,14 @@ def test_publish_removes_first_lane_when_label_publication_fails(
         tmp_path / "data" / "observable" / tiny_job.split / tiny_job.condition_id / "0"
     )
     label_path = tmp_path / "data" / "labels" / tiny_job.split / tiny_job.condition_id / "0"
-    original_replace = artifact_module.os.replace
+    original_rename = artifact_module._rename_no_replace
 
     def fail_label_publish(source: Path, target: Path) -> None:
         if target == label_path:
             raise OSError("simulated label publication failure")
-        original_replace(source, target)
+        original_rename(source, target)
 
-    monkeypatch.setattr(artifact_module.os, "replace", fail_label_publish)
+    monkeypatch.setattr(artifact_module, "_rename_no_replace", fail_label_publish)
     with pytest.raises(OSError, match="label publication failure"):
         publish_trajectory(tmp_path, tiny_job, _observable(), _labels(), {"schema_version": 1})
     assert not observable_path.exists()

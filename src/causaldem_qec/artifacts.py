@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import io
 import json
@@ -22,6 +24,9 @@ from causaldem_qec.core import (
     validate_labels,
     validate_observable,
 )
+
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
 
 
 def _json_value(value: object) -> object:
@@ -104,15 +109,42 @@ def verify_artifact(path: Path) -> str:
     return hashlib.sha256(sums.encode("ascii")).hexdigest()
 
 
+def _rename_no_replace(source: Path, target: Path) -> None:
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as error:
+        raise OSError(errno.ENOSYS, "renameat2 is required for safe publication") from error
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if (
+        renameat2(
+            _AT_FDCWD,
+            os.fsencode(source),
+            _AT_FDCWD,
+            os.fsencode(target),
+            _RENAME_NOREPLACE,
+        )
+        != 0
+    ):
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), target)
+
+
 def _publish_directory(staging: Path, target: Path) -> tuple[str, bool]:
     artifact_hash = _write_sums(staging)
-    if target.exists():
+    try:
+        _rename_no_replace(staging, target)
+    except FileExistsError:
         if verify_artifact(target) == artifact_hash:
             shutil.rmtree(staging)
             return artifact_hash, False
         raise FileExistsError(f"artifact conflict: {target}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(staging, target)
     return artifact_hash, True
 
 
@@ -240,8 +272,13 @@ def _preflight_pair(
 
 
 def _remove_owned_artifact(path: Path, artifact_hash: str) -> None:
-    if path.exists() and verify_artifact(path) == artifact_hash:
-        shutil.rmtree(path)
+    try:
+        matches_owned_artifact = path.exists() and verify_artifact(path) == artifact_hash
+        if matches_owned_artifact:
+            shutil.rmtree(path)
+    except (OSError, ValueError):
+        return
+    if matches_owned_artifact:
         try:
             _fsync_directory(path.parent)
         except OSError:
