@@ -24,6 +24,7 @@ from causaldem_qec.core import (
     ObservableTrajectory,
     TrajectoryJob,
     deserialize_manifest_provenance,
+    serialize_manifest_provenance,
     validate_labels,
     validate_observable,
 )
@@ -614,14 +615,27 @@ def _checkpoint_lane_index(
     return indexed
 
 
-def _checkpoint_manifest(
-    root: Path,
-    *,
-    expected_config_hash: str | None,
-    expected_provenance: ManifestProvenance | None,
-) -> Mapping[str, object]:
+def _validate_checkpoint_expectations(
+    expected_config_hash: object,
+    expected_provenance: object,
+) -> tuple[str, ManifestProvenance]:
+    if (
+        not isinstance(expected_config_hash, str)
+        or not _is_sha256_digest(expected_config_hash)
+        or not isinstance(expected_provenance, ManifestProvenance)
+        or expected_provenance.execution_backend != "kaggle"
+        or expected_provenance.checkpoint_identity is None
+    ):
+        raise ArtifactConflict("invalid expected checkpoint identity")
+    return expected_config_hash, expected_provenance
+
+
+def _read_checkpoint_manifest(root: Path) -> Mapping[str, object]:
+    manifest_path = root / "run_manifest.json"
+    if manifest_path.is_symlink():
+        raise ArtifactConflict("invalid checkpoint manifest")
     try:
-        value: object = json.loads((root / "run_manifest.json").read_text(encoding="utf-8"))
+        value: object = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ArtifactConflict("invalid checkpoint manifest") from error
     if not isinstance(value, Mapping) or not isinstance(value.get("results"), list):
@@ -630,6 +644,19 @@ def _checkpoint_manifest(
         _reject_raw_seed_metadata(value)
     except ValueError as error:
         raise ArtifactConflict("checkpoint manifest contains raw seed data") from error
+    return value
+
+
+def _checkpoint_manifest(
+    root: Path,
+    *,
+    expected_config_hash: str,
+    expected_provenance: ManifestProvenance,
+) -> Mapping[str, object]:
+    expected_config_hash, expected_provenance = _validate_checkpoint_expectations(
+        expected_config_hash, expected_provenance
+    )
+    value = _read_checkpoint_manifest(root)
     try:
         provenance = deserialize_manifest_provenance(value.get("provenance"))
     except (KeyError, TypeError, ValueError) as error:
@@ -641,8 +668,8 @@ def _checkpoint_manifest(
         or not _is_sha256_digest(config_hash)
         or provenance.execution_backend != "kaggle"
         or provenance.checkpoint_identity is None
-        or (expected_config_hash is not None and config_hash != expected_config_hash)
-        or (expected_provenance is not None and provenance != expected_provenance)
+        or config_hash != expected_config_hash
+        or provenance != expected_provenance
     ):
         raise ArtifactConflict("checkpoint manifest identity mismatch")
     return value
@@ -707,18 +734,10 @@ def _verified_checkpoint_pair(
     )
 
 
-def inventory_checkpoint(
+def _inventory_checkpoint(
     root: Path,
-    *,
-    expected_config_hash: str | None = None,
-    expected_provenance: ManifestProvenance | None = None,
+    manifest: Mapping[str, object],
 ) -> tuple[CheckpointPair, ...]:
-    """Return only manifest-committed, independently verified artifact pairs."""
-    manifest = _checkpoint_manifest(
-        root,
-        expected_config_hash=expected_config_hash,
-        expected_provenance=expected_provenance,
-    )
     resolved_config_hash = manifest.get("resolved_config_hash")
     if not isinstance(resolved_config_hash, str) or not resolved_config_hash:
         raise ArtifactConflict("invalid checkpoint manifest configuration")
@@ -778,6 +797,154 @@ def inventory_checkpoint(
     return tuple(inventory)
 
 
+def inventory_checkpoint(
+    root: Path,
+    *,
+    expected_config_hash: str,
+    expected_provenance: ManifestProvenance,
+) -> tuple[CheckpointPair, ...]:
+    """Return pairs verified against identity supplied outside the checkpoint."""
+    manifest = _checkpoint_manifest(
+        root,
+        expected_config_hash=expected_config_hash,
+        expected_provenance=expected_provenance,
+    )
+    return _inventory_checkpoint(root, manifest)
+
+
+_LEGACY_BOOTSTRAP_CONFIG_HASH = "bcd3d21f1a013da6767b935bc6d452f927d13d2ec4ef0fc3326145a55a01d09c"
+_LEGACY_BOOTSTRAP_GENERATION = {
+    "burn_in_rounds": 4096,
+    "scored_rounds": 8192,
+    "trajectories_per_condition": 64,
+}
+_LEGACY_D3_CONDITIONS = (
+    ("f01", 4),
+    ("f02", 4),
+    ("f03", 4),
+    ("f06", 3),
+    ("f07", 3),
+    ("f08", 3),
+    ("f12", 2),
+    ("f14_negative", 2),
+    ("f14_positive", 2),
+)
+_LEGACY_D5_CONDITIONS = (
+    ("f01", 4),
+    ("f03", 4),
+    ("f06", 3),
+    ("f12", 2),
+    ("f14_negative", 2),
+    ("f14_positive", 2),
+)
+
+
+def _legacy_bootstrap_keys(family: str) -> tuple[tuple[str, int], ...]:
+    keys: list[tuple[str, int]] = []
+    for distance, conditions in ((3, _LEGACY_D3_CONDITIONS), (5, _LEGACY_D5_CONDITIONS)):
+        for dynamics, count in conditions:
+            keys.extend(
+                (f"{family}_d{distance}__{dynamics}", trajectory_id)
+                for trajectory_id in range(count)
+            )
+    return tuple(keys)
+
+
+_LEGACY_BOOTSTRAP_COMPLETED_KEYS = _legacy_bootstrap_keys("repetition")
+_LEGACY_BOOTSTRAP_EXPECTED_KEYS = (
+    *_LEGACY_BOOTSTRAP_COMPLETED_KEYS,
+    *_legacy_bootstrap_keys("surface"),
+)
+_LEGACY_BOOTSTRAP_MANIFEST_KEYS = frozenset(
+    {
+        "dataset_profile",
+        "expected_job_keys",
+        "generation",
+        "resolved_config_hash",
+        "results",
+        "schema_version",
+    }
+)
+_LEGACY_BOOTSTRAP_RESULT_KEYS = frozenset(
+    {
+        "completed",
+        "condition_id",
+        "failure",
+        "label_hash",
+        "observable_hash",
+        "pair_id",
+        "trajectory_id",
+    }
+)
+
+
+def upgrade_legacy_kaggle_bootstrap(
+    root: Path,
+    *,
+    expected_config_hash: str,
+    expected_provenance: ManifestProvenance,
+) -> Path:
+    """Validate and provenance-bind only the original 44-pair pilot bootstrap."""
+    expected_config_hash, expected_provenance = _validate_checkpoint_expectations(
+        expected_config_hash, expected_provenance
+    )
+    manifest = _read_checkpoint_manifest(root)
+    results = manifest.get("results")
+    expected_job_keys = [
+        [condition, trajectory] for condition, trajectory in _LEGACY_BOOTSTRAP_EXPECTED_KEYS
+    ]
+    if (
+        expected_config_hash != _LEGACY_BOOTSTRAP_CONFIG_HASH
+        or frozenset(manifest) != _LEGACY_BOOTSTRAP_MANIFEST_KEYS
+        or manifest.get("schema_version") != 1
+        or manifest.get("dataset_profile") != "pilot"
+        or manifest.get("resolved_config_hash") != expected_config_hash
+        or manifest.get("generation") != _LEGACY_BOOTSTRAP_GENERATION
+        or manifest.get("expected_job_keys") != expected_job_keys
+        or not isinstance(results, list)
+        or len(results) != len(_LEGACY_BOOTSTRAP_COMPLETED_KEYS)
+    ):
+        raise ArtifactConflict("legacy bootstrap identity mismatch")
+    result_keys: list[tuple[str, int]] = []
+    for result in results:
+        if (
+            not isinstance(result, Mapping)
+            or frozenset(result) != _LEGACY_BOOTSTRAP_RESULT_KEYS
+            or result.get("completed") is not True
+            or result.get("failure") is not None
+            or not isinstance(result.get("condition_id"), str)
+            or isinstance(result.get("trajectory_id"), bool)
+            or not isinstance(result.get("trajectory_id"), int)
+        ):
+            raise ArtifactConflict("legacy bootstrap identity mismatch")
+        result_keys.append((str(result["condition_id"]), int(result["trajectory_id"])))
+    if tuple(result_keys) != _LEGACY_BOOTSTRAP_COMPLETED_KEYS:
+        raise ArtifactConflict("legacy bootstrap identity mismatch")
+    observable_paths = _checkpoint_lane_index(root, "observable")
+    label_paths = _checkpoint_lane_index(root, "labels")
+    if set(observable_paths) != set(_LEGACY_BOOTSTRAP_COMPLETED_KEYS) or set(label_paths) != set(
+        _LEGACY_BOOTSTRAP_COMPLETED_KEYS
+    ):
+        raise ArtifactConflict("legacy bootstrap artifact identity mismatch")
+    commitment_path = root / "data" / "manifests" / "sealed_commitment.json"
+    try:
+        sealed_commitment = json.loads(commitment_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ArtifactConflict("legacy bootstrap sealed commitment is invalid") from error
+    if not _is_sha256_commitment(sealed_commitment):
+        raise ArtifactConflict("legacy bootstrap sealed commitment is invalid")
+    validated_manifest = dict(manifest)
+    validated_manifest["sealed_commitment"] = sealed_commitment
+    inventory = _inventory_checkpoint(root, validated_manifest)
+    if len(inventory) != len(_LEGACY_BOOTSTRAP_COMPLETED_KEYS):
+        raise ArtifactConflict("legacy bootstrap artifact identity mismatch")
+    upgraded_manifest = dict(validated_manifest)
+    upgraded_manifest["provenance"] = serialize_manifest_provenance(expected_provenance)
+    manifest_path = root / "run_manifest.json"
+    _atomic_write(manifest_path, lambda temporary: _write_json(temporary, upgraded_manifest))
+    return manifest_path
+
+
 _CHECKPOINT_ARTIFACT_FILES = ("arrays.npz", "metadata.json", "SHA256SUMS")
 
 
@@ -801,6 +968,8 @@ def _checkpoint_export_matches(
     source: Path,
     destination: Path,
     inventory: tuple[CheckpointPair, ...],
+    expected_config_hash: str,
+    expected_provenance: ManifestProvenance,
 ) -> bool:
     try:
         if destination.is_symlink() or not destination.is_dir():
@@ -812,7 +981,14 @@ def _checkpoint_export_matches(
             source / "run_manifest.json"
         ).read_bytes():
             return False
-        if inventory_checkpoint(destination) != inventory:
+        if (
+            inventory_checkpoint(
+                destination,
+                expected_config_hash=expected_config_hash,
+                expected_provenance=expected_provenance,
+            )
+            != inventory
+        ):
             return False
         actual_files = {path.relative_to(destination) for path in entries if path.is_file()}
         return actual_files == _checkpoint_file_set(inventory)
@@ -825,11 +1001,19 @@ def _publish_checkpoint_export(
     destination: Path,
     source: Path,
     inventory: tuple[CheckpointPair, ...],
+    expected_config_hash: str,
+    expected_provenance: ManifestProvenance,
 ) -> None:
     try:
         _rename_no_replace(staging, destination)
     except FileExistsError as error:
-        if _checkpoint_export_matches(source, destination, inventory):
+        if _checkpoint_export_matches(
+            source,
+            destination,
+            inventory,
+            expected_config_hash,
+            expected_provenance,
+        ):
             shutil.rmtree(staging)
             return
         raise ArtifactConflict(f"checkpoint export conflict: {destination}") from error
@@ -846,7 +1030,13 @@ def _publish_checkpoint_export(
         try:
             os.close(descriptor)
             if destination.exists():
-                if _checkpoint_export_matches(source, destination, inventory):
+                if _checkpoint_export_matches(
+                    source,
+                    destination,
+                    inventory,
+                    expected_config_hash,
+                    expected_provenance,
+                ):
                     shutil.rmtree(staging)
                     return
                 raise ArtifactConflict(f"checkpoint export conflict: {destination}")
@@ -863,8 +1053,8 @@ def export_checkpoint(
     source: Path,
     destination: Path,
     *,
-    expected_config_hash: str | None = None,
-    expected_provenance: ManifestProvenance | None = None,
+    expected_config_hash: str,
+    expected_provenance: ManifestProvenance,
 ) -> Path:
     """Atomically export a manifest and its verified artifact pairs."""
     inventory = inventory_checkpoint(
@@ -873,7 +1063,13 @@ def export_checkpoint(
         expected_provenance=expected_provenance,
     )
     if destination.exists():
-        if _checkpoint_export_matches(source, destination, inventory):
+        if _checkpoint_export_matches(
+            source,
+            destination,
+            inventory,
+            expected_config_hash,
+            expected_provenance,
+        ):
             return destination
         raise ArtifactConflict(f"checkpoint export conflict: {destination}")
     staging = _staging_directory(destination)
@@ -890,9 +1086,23 @@ def export_checkpoint(
         ):
             _fsync_directory(directory)
         _fsync_directory(staging)
-        if inventory_checkpoint(staging) != inventory:
+        if (
+            inventory_checkpoint(
+                staging,
+                expected_config_hash=expected_config_hash,
+                expected_provenance=expected_provenance,
+            )
+            != inventory
+        ):
             raise ArtifactConflict("checkpoint export verification mismatch")
-        _publish_checkpoint_export(staging, destination, source, inventory)
+        _publish_checkpoint_export(
+            staging,
+            destination,
+            source,
+            inventory,
+            expected_config_hash,
+            expected_provenance,
+        )
         return destination
     finally:
         if staging.exists():

@@ -47,6 +47,7 @@ CHECKPOINT_PROVENANCE = ManifestProvenance(
     checkpoint_identity="pilot-checkpoint:2",
 )
 CHECKPOINT_SEALED_COMMITMENT = {"algorithm": "sha256", "digest": "b" * 64}
+LEGACY_CHECKPOINT_CONFIG_HASH = "bcd3d21f1a013da6767b935bc6d452f927d13d2ec4ef0fc3326145a55a01d09c"
 
 
 def test_execution_options_are_frozen_and_normalize_the_backend() -> None:
@@ -319,12 +320,31 @@ def _labels(rounds: int = 64, classes: int = 2) -> LabelTrajectory:
     )
 
 
-def _checkpoint_metadata() -> dict[str, object]:
+def _checkpoint_metadata(
+    config_hash: str = CHECKPOINT_CONFIG_HASH,
+) -> dict[str, object]:
     return {
         "schema_version": 1,
         "dataset_profile": "pilot",
-        "resolved_config_hash": CHECKPOINT_CONFIG_HASH,
+        "resolved_config_hash": config_hash,
     }
+
+
+def _checkpoint_inventory(root: Path) -> tuple[artifact_module.CheckpointPair, ...]:
+    return artifact_module.inventory_checkpoint(
+        root,
+        expected_config_hash=CHECKPOINT_CONFIG_HASH,
+        expected_provenance=CHECKPOINT_PROVENANCE,
+    )
+
+
+def _checkpoint_export(source: Path, destination: Path) -> Path:
+    return artifact_module.export_checkpoint(
+        source,
+        destination,
+        expected_config_hash=CHECKPOINT_CONFIG_HASH,
+        expected_provenance=CHECKPOINT_PROVENANCE,
+    )
 
 
 def _write_checkpoint_manifest(
@@ -376,6 +396,175 @@ def _add_checksum_valid_checkpoint_array(root: Path, artifact_path: Path, name: 
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
 
+def _write_legacy_bootstrap_checkpoint(root: Path) -> tuple[Path, ...]:
+    jobs = tuple(
+        sorted(
+            expand_jobs(load_spec(PILOT_CONFIG), include_sealed=True),
+            key=lambda job: (job.condition_id, job.trajectory_id),
+        )
+    )
+    completed_jobs = tuple(job for job in jobs if job.circuit.family == "repetition")
+    assert len(jobs) == 88
+    assert len(completed_jobs) == 44
+    artifact_paths: list[Path] = []
+    results: list[dict[str, object]] = []
+    for job in completed_jobs:
+        observable_path, label_path = publish_trajectory(
+            root,
+            job,
+            _observable(),
+            _labels(),
+            _checkpoint_metadata(LEGACY_CHECKPOINT_CONFIG_HASH),
+        )
+        artifact_paths.extend((observable_path, label_path))
+        metadata = json.loads((observable_path / "metadata.json").read_text(encoding="utf-8"))
+        results.append(
+            {
+                "completed": True,
+                "condition_id": job.condition_id,
+                "failure": None,
+                "label_hash": verify_artifact(label_path),
+                "observable_hash": verify_artifact(observable_path),
+                "pair_id": metadata["pair_id"],
+                "trajectory_id": job.trajectory_id,
+            }
+        )
+    commitment_path = root / "data" / "manifests" / "sealed_commitment.json"
+    commitment_path.parent.mkdir(parents=True)
+    commitment_path.write_text(json.dumps(CHECKPOINT_SEALED_COMMITMENT), encoding="utf-8")
+    manifest = {
+        "dataset_profile": "pilot",
+        "expected_job_keys": [[job.condition_id, job.trajectory_id] for job in jobs],
+        "generation": {
+            "burn_in_rounds": 4096,
+            "scored_rounds": 8192,
+            "trajectories_per_condition": 64,
+        },
+        "resolved_config_hash": LEGACY_CHECKPOINT_CONFIG_HASH,
+        "results": results,
+        "schema_version": 1,
+    }
+    (root / "run_manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return tuple(artifact_paths)
+
+
+@pytest.mark.parametrize("operation", ["inventory", "export"])
+@pytest.mark.parametrize("omission", ["both", "config", "provenance"])
+def test_public_checkpoint_workflow_requires_caller_supplied_identity(
+    tmp_path: Path, operation: str, omission: str
+) -> None:
+    arguments: dict[str, object] = {
+        "expected_config_hash": CHECKPOINT_CONFIG_HASH,
+        "expected_provenance": CHECKPOINT_PROVENANCE,
+    }
+    if omission == "both":
+        arguments.clear()
+    elif omission == "config":
+        del arguments["expected_config_hash"]
+    else:
+        del arguments["expected_provenance"]
+
+    with pytest.raises(TypeError):
+        if operation == "inventory":
+            artifact_module.inventory_checkpoint(tmp_path, **arguments)  # type: ignore[arg-type]
+        else:
+            artifact_module.export_checkpoint(  # type: ignore[arg-type]
+                tmp_path,
+                tmp_path / "export",
+                **arguments,
+            )
+
+
+def test_legacy_bootstrap_upgrade_validates_all_44_pairs_before_workflow(
+    tmp_path: Path,
+) -> None:
+    artifact_paths = _write_legacy_bootstrap_checkpoint(tmp_path)
+    before_hashes = tuple(verify_artifact(path) for path in artifact_paths)
+
+    manifest_path = artifact_module.upgrade_legacy_kaggle_bootstrap(
+        tmp_path,
+        expected_config_hash=LEGACY_CHECKPOINT_CONFIG_HASH,
+        expected_provenance=CHECKPOINT_PROVENANCE,
+    )
+
+    upgraded = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert upgraded["provenance"] == serialize_manifest_provenance(CHECKPOINT_PROVENANCE)
+    assert upgraded["sealed_commitment"] == CHECKPOINT_SEALED_COMMITMENT
+    assert tuple(verify_artifact(path) for path in artifact_paths) == before_hashes
+    inventory = artifact_module.inventory_checkpoint(
+        tmp_path,
+        expected_config_hash=LEGACY_CHECKPOINT_CONFIG_HASH,
+        expected_provenance=CHECKPOINT_PROVENANCE,
+    )
+    assert len(inventory) == 44
+    export = tmp_path / "export"
+    assert (
+        artifact_module.export_checkpoint(
+            tmp_path,
+            export,
+            expected_config_hash=LEGACY_CHECKPOINT_CONFIG_HASH,
+            expected_provenance=CHECKPOINT_PROVENANCE,
+        )
+        == export
+    )
+
+
+def test_legacy_bootstrap_upgrade_refuses_an_arbitrary_checkpoint(
+    tmp_path: Path, tiny_job: TrajectoryJob
+) -> None:
+    observable_path, label_path = publish_trajectory(
+        tmp_path,
+        tiny_job,
+        _observable(),
+        _labels(),
+        _checkpoint_metadata(LEGACY_CHECKPOINT_CONFIG_HASH),
+    )
+    _write_checkpoint_manifest(tmp_path, tiny_job, observable_path, label_path)
+    manifest_path = tmp_path / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["provenance"]
+    manifest["resolved_config_hash"] = LEGACY_CHECKPOINT_CONFIG_HASH
+    original = json.dumps(manifest).encode()
+    manifest_path.write_bytes(original)
+
+    with pytest.raises(artifact_module.ArtifactConflict, match="legacy bootstrap identity"):
+        artifact_module.upgrade_legacy_kaggle_bootstrap(
+            tmp_path,
+            expected_config_hash=LEGACY_CHECKPOINT_CONFIG_HASH,
+            expected_provenance=CHECKPOINT_PROVENANCE,
+        )
+    assert manifest_path.read_bytes() == original
+
+
+@pytest.mark.parametrize("failure", ["config", "raw_seed", "corrupt_pair"])
+def test_legacy_bootstrap_upgrade_rejects_invalid_input_without_rewriting_manifest(
+    tmp_path: Path, failure: str
+) -> None:
+    artifact_paths = _write_legacy_bootstrap_checkpoint(tmp_path)
+    manifest_path = tmp_path / "run_manifest.json"
+    expected_config_hash = LEGACY_CHECKPOINT_CONFIG_HASH
+    if failure == "config":
+        expected_config_hash = "c" * 64
+    elif failure == "raw_seed":
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["root_seed"] = 713
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    else:
+        (artifact_paths[0] / "arrays.npz").write_bytes(b"corrupt")
+    original = manifest_path.read_bytes()
+
+    with pytest.raises(artifact_module.ArtifactConflict):
+        artifact_module.upgrade_legacy_kaggle_bootstrap(
+            tmp_path,
+            expected_config_hash=expected_config_hash,
+            expected_provenance=CHECKPOINT_PROVENANCE,
+        )
+    assert manifest_path.read_bytes() == original
+
+
 def test_checkpoint_inventory_includes_only_manifest_verified_complete_pairs(
     tmp_path: Path, tiny_job: TrajectoryJob
 ) -> None:
@@ -395,7 +584,7 @@ def test_checkpoint_inventory_includes_only_manifest_verified_complete_pairs(
     secrets.mkdir()
     (secrets / "sealed_private.json").write_text('{"root_seed": 99887766}', encoding="utf-8")
 
-    inventory = artifact_module.inventory_checkpoint(tmp_path)
+    inventory = _checkpoint_inventory(tmp_path)
 
     assert len(inventory) == 1
     assert inventory[0].relative_path == Path(
@@ -420,7 +609,7 @@ def test_checkpoint_inventory_rejects_checksum_valid_noncontract_arrays(
     _add_checksum_valid_checkpoint_array(tmp_path, observable_path, array_name)
 
     with pytest.raises(artifact_module.ArtifactConflict, match="schema"):
-        artifact_module.inventory_checkpoint(tmp_path)
+        _checkpoint_inventory(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -480,7 +669,7 @@ def test_checkpoint_inventory_rejects_invalid_sealed_commitment_constraints(
         )
 
     with pytest.raises(artifact_module.ArtifactConflict, match="sealed commitment"):
-        artifact_module.inventory_checkpoint(tmp_path)
+        _checkpoint_inventory(tmp_path)
 
 
 @pytest.mark.parametrize("field", ["observable_hash", "label_hash", "pair_id"])
@@ -504,7 +693,7 @@ def test_checkpoint_inventory_rejects_manifest_pair_conflicts(
     )
 
     with pytest.raises(artifact_module.ArtifactConflict, match="identity mismatch"):
-        artifact_module.inventory_checkpoint(tmp_path)
+        _checkpoint_inventory(tmp_path)
 
 
 def test_checkpoint_inventory_rejects_a_manifest_completed_single_lane(
@@ -521,7 +710,7 @@ def test_checkpoint_inventory_rejects_a_manifest_completed_single_lane(
     shutil.rmtree(label_path)
 
     with pytest.raises(artifact_module.ArtifactConflict, match="incomplete checkpoint"):
-        artifact_module.inventory_checkpoint(tmp_path)
+        _checkpoint_inventory(tmp_path)
 
 
 def test_checkpoint_inventory_rejects_raw_seed_manifest_metadata(
@@ -541,7 +730,7 @@ def test_checkpoint_inventory_rejects_raw_seed_manifest_metadata(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(artifact_module.ArtifactConflict, match="raw seed"):
-        artifact_module.inventory_checkpoint(tmp_path)
+        _checkpoint_inventory(tmp_path)
 
 
 def test_export_checkpoint_preserves_manifest_and_copies_only_verified_files(
@@ -563,12 +752,10 @@ def test_export_checkpoint_preserves_manifest_and_copies_only_verified_files(
     (secrets / "sealed_private.json").write_text('{"root_seed": 99887766}', encoding="utf-8")
     shutil.copytree(observable_path, observable_path.parent / ".1.staging-interrupted")
 
-    assert artifact_module.export_checkpoint(source, export) == export
+    assert _checkpoint_export(source, export) == export
 
     assert (export / "run_manifest.json").read_bytes() == manifest_bytes
-    assert artifact_module.inventory_checkpoint(export) == artifact_module.inventory_checkpoint(
-        source
-    )
+    assert _checkpoint_inventory(export) == _checkpoint_inventory(source)
     relative_files = {
         path.relative_to(export).as_posix() for path in export.rglob("*") if path.is_file()
     }
@@ -603,7 +790,7 @@ def test_export_checkpoint_never_overwrites_a_conflicting_destination(
     marker.write_text("existing export", encoding="utf-8")
 
     with pytest.raises(artifact_module.ArtifactConflict, match="checkpoint export conflict"):
-        artifact_module.export_checkpoint(source, export)
+        _checkpoint_export(source, export)
     assert marker.read_text(encoding="utf-8") == "existing export"
 
 
@@ -617,11 +804,11 @@ def test_export_checkpoint_rejects_a_symlink_destination(
         source, tiny_job, _observable(), _labels(), _checkpoint_metadata()
     )
     _write_checkpoint_manifest(source, tiny_job, observable_path, label_path)
-    artifact_module.export_checkpoint(source, real_export)
+    _checkpoint_export(source, real_export)
     linked_export.symlink_to(real_export, target_is_directory=True)
 
     with pytest.raises(artifact_module.ArtifactConflict, match="checkpoint export conflict"):
-        artifact_module.export_checkpoint(source, linked_export)
+        _checkpoint_export(source, linked_export)
 
 
 @pytest.mark.parametrize("linked_file", ["manifest", "artifact"])
@@ -634,7 +821,7 @@ def test_export_checkpoint_rejects_symlink_files_in_an_existing_destination(
         source, tiny_job, _observable(), _labels(), _checkpoint_metadata()
     )
     _write_checkpoint_manifest(source, tiny_job, observable_path, label_path)
-    artifact_module.export_checkpoint(source, export)
+    _checkpoint_export(source, export)
     relative = (
         Path("run_manifest.json")
         if linked_file == "manifest"
@@ -645,7 +832,7 @@ def test_export_checkpoint_rejects_symlink_files_in_an_existing_destination(
     linked_path.symlink_to(source / relative)
 
     with pytest.raises(artifact_module.ArtifactConflict, match="checkpoint export conflict"):
-        artifact_module.export_checkpoint(source, export)
+        _checkpoint_export(source, export)
 
 
 def test_export_checkpoint_recovers_after_postrename_sync_failure(
@@ -670,11 +857,11 @@ def test_export_checkpoint_recovers_after_postrename_sync_failure(
 
     monkeypatch.setattr(artifact_module, "_fsync_directory", fail_export_parent_sync)
     with pytest.raises(OSError, match="post-rename sync failure"):
-        artifact_module.export_checkpoint(source, export)
-    assert artifact_module.inventory_checkpoint(export)
+        _checkpoint_export(source, export)
+    assert _checkpoint_inventory(export)
 
     monkeypatch.setattr(artifact_module, "_fsync_directory", original_fsync)
-    assert artifact_module.export_checkpoint(source, export) == export
+    assert _checkpoint_export(source, export) == export
 
 
 def test_observable_and_labels_publish_to_separate_hashes(
