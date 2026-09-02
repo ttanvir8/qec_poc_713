@@ -1,3 +1,4 @@
+import json
 from collections import Counter
 from dataclasses import replace
 from itertools import pairwise
@@ -480,3 +481,59 @@ def test_failed_trajectory_remains_in_manifest(tiny_spec, tmp_path: Path) -> Non
     manifest = generate_matrix(invalid, jobs, tmp_path, workers=1)
     assert manifest.completed == 0
     assert manifest.failures[0].trajectory_id == 0
+
+
+def test_manifest_binds_common_pair_id_to_completed_lane_hashes(tiny_spec, tmp_path: Path) -> None:
+    jobs = expand_jobs(tiny_spec, include_sealed=False)[:1]
+    generate_matrix(tiny_spec, jobs, tmp_path, workers=1)
+    result = json.loads((tmp_path / "run_manifest.json").read_text(encoding="utf-8"))["results"][0]
+    observable = json.loads(
+        (
+            tmp_path
+            / "data"
+            / "observable"
+            / jobs[0].split
+            / jobs[0].condition_id
+            / "0"
+            / "metadata.json"
+        ).read_text(encoding="utf-8")
+    )
+    labels = json.loads(
+        (
+            tmp_path
+            / "data"
+            / "labels"
+            / jobs[0].split
+            / jobs[0].condition_id
+            / "0"
+            / "metadata.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert result["pair_id"] == observable["pair_id"] == labels["pair_id"]
+    assert result["observable_hash"]
+    assert result["label_hash"]
+
+
+def test_config_changed_failure_is_not_resumed_by_job_key(tiny_spec, tmp_path: Path) -> None:
+    jobs = expand_jobs(tiny_spec, include_sealed=False)[:1]
+    invalid_bounds = dict(tiny_spec.component_bounds)
+    invalid_bounds["repetition_data"] = (0.6, 0.7)
+    failed = replace(tiny_spec, component_bounds=invalid_bounds)
+    assert generate_matrix(failed, jobs, tmp_path, workers=1).failures
+    recovered = generate_matrix(tiny_spec, jobs, tmp_path, workers=1)
+    assert recovered.generated == 1
+    assert recovered.completed == 1
+
+
+def test_resume_rejects_manifest_pair_id_that_disagrees_with_verified_lanes(
+    tiny_spec, tmp_path: Path
+) -> None:
+    jobs = expand_jobs(tiny_spec, include_sealed=False)[:1]
+    generate_matrix(tiny_spec, jobs, tmp_path, workers=1)
+    manifest_path = tmp_path / "run_manifest.json"
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    document["results"][0]["pair_id"] = "0" * 64
+    manifest_path.write_text(json.dumps(document), encoding="utf-8")
+    resumed = generate_matrix(tiny_spec, jobs, tmp_path, workers=1)
+    assert resumed.completed == 0
+    assert resumed.failures[0].code.value == "artifact_conflict"

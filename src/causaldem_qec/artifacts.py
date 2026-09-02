@@ -516,7 +516,7 @@ def trajectory_paths(root: Path, job: TrajectoryJob) -> tuple[Path, Path]:
 
 def verify_trajectory_pair(
     root: Path, job: TrajectoryJob, *, resolved_config_hash: str
-) -> tuple[str, str] | None:
+) -> tuple[str, str, str] | None:
     """Return hashes only for a matching, independently verified artifact pair."""
     observable_path, label_path = trajectory_paths(root, job)
     observable_exists, label_exists = observable_path.exists(), label_path.exists()
@@ -546,18 +546,29 @@ def verify_trajectory_pair(
         or observable_run.get("resolved_config_hash") != resolved_config_hash
     ):
         raise ArtifactConflict("artifact pair configuration mismatch")
-    return observable_hash, label_hash
+    return observable_hash, label_hash, str(observable_metadata["pair_id"])
 
 
 def write_sealed_commitment(private_path: Path, commitment_path: Path) -> str:
     """Commit canonical private seed bytes without copying the seed into public data."""
     private_bytes = private_path.read_bytes()
     digest = hashlib.sha256(private_bytes).hexdigest()
-    if commitment_path.exists():
-        raise FileExistsError(f"sealed commitment exists: {commitment_path}")
     commitment_path.parent.mkdir(parents=True, exist_ok=True)
-    commitment_path.write_bytes(_canonical_json({"algorithm": "sha256", "digest": digest}))
-    _fsync_file(commitment_path)
+    try:
+        descriptor = os.open(commitment_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError as error:
+        raise FileExistsError(f"sealed commitment exists: {commitment_path}") from error
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(_canonical_json({"algorithm": "sha256", "digest": digest}))
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            commitment_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
     _fsync_directory(commitment_path.parent)
     return digest
 

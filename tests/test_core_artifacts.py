@@ -1,6 +1,7 @@
 import errno
 import json
 import shutil
+import stat
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
@@ -552,3 +553,14 @@ def test_freeze_refuses_an_existing_commitment_without_creating_private_seed(
     with pytest.raises(FileExistsError, match="sealed commitment exists"):
         _freeze_sealed(spec, private, tmp_path)
     assert not private.exists()
+
+
+def test_freeze_creates_private_seed_exclusively_with_mode_0600(tmp_path: Path) -> None:
+    spec = load_spec(CONFIG)
+    private = tmp_path / "private.json"
+    digest = _freeze_sealed(spec, private, tmp_path)
+    assert stat.S_IMODE(private.stat().st_mode) == 0o600
+    with pytest.raises(FileExistsError):
+        _freeze_sealed(spec, private, tmp_path)
+    assert (tmp_path / "data" / "manifests" / "sealed_commitment.json").read_bytes()
+    assert digest

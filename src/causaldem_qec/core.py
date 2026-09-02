@@ -154,19 +154,23 @@ class TrajectoryResult:
     completed: bool
     observable_hash: str | None
     label_hash: str | None
+    pair_id: str | None
     failure: TrajectoryFailure | None
 
     @classmethod
     def complete(
-        cls, job: TrajectoryJob, observable_hash: str, label_hash: str
+        cls, job: TrajectoryJob, observable_hash: str, label_hash: str, pair_id: str
     ) -> TrajectoryResult:
-        return cls((job.condition_id, job.trajectory_id), True, observable_hash, label_hash, None)
+        return cls(
+            (job.condition_id, job.trajectory_id), True, observable_hash, label_hash, pair_id, None
+        )
 
     @classmethod
     def failed(cls, job: TrajectoryJob, code: FailureCode, message: str) -> TrajectoryResult:
         return cls(
             (job.condition_id, job.trajectory_id),
             False,
+            None,
             None,
             None,
             TrajectoryFailure(job.condition_id, job.trajectory_id, "generate", code, message),

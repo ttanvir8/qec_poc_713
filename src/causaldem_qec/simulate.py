@@ -19,7 +19,6 @@ from causaldem_qec.artifacts import (
     ArtifactConflict,
     canonical_digest,
     publish_trajectory,
-    verify_artifact,
     verify_trajectory_pair,
     write_manifest,
 )
@@ -1387,11 +1386,35 @@ def _future_block_probability(class_probability: np.ndarray, block_rounds: int) 
 def _resolved_config_hash(spec: PocSpec) -> str:
     return canonical_digest(
         {
-            "config": spec.raw,
-            "generation": {
+            "raw": spec.raw,
+            "resolved": {
+                "circuits": tuple(
+                    {
+                        "circuit_id": item.circuit_id,
+                        "family": item.family,
+                        "distance": item.distance,
+                    }
+                    for item in spec.circuits
+                ),
+                "condition_sets": spec.condition_sets,
+                "component_bounds": spec.component_bounds,
+                "dynamics": spec.dynamics,
+                "public_root_seed": spec.public_root_seed,
                 "trajectories_per_condition": spec.trajectories_per_condition,
                 "burn_in_rounds": spec.burn_in_rounds,
                 "scored_rounds": spec.scored_rounds,
+                "episode_rounds": spec.episode_rounds,
+                "block_rounds": spec.block_rounds,
+                "target_config": spec.target_config,
+                "fit_config": spec.fit_config,
+                "forecast_samples": spec.forecast_samples,
+                "forecast_reference_samples": spec.forecast_reference_samples,
+                "forecast_mean_tolerance": spec.forecast_mean_tolerance,
+                "bootstrap_resamples": spec.bootstrap_resamples,
+                "confidence_level": spec.confidence_level,
+                "retry_attempts": spec.retry_attempts,
+                "chunk_rounds": spec.chunk_rounds,
+                "roots": spec.roots,
             },
         }
     )
@@ -1486,12 +1509,15 @@ def generate_job(request: GenerationRequest) -> TrajectoryResult:
             observable, labels, metadata = assemble_artifacts(
                 request, path, sampled, attempt=attempt
             )
-            observable_path, label_path = publish_trajectory(
-                request.root, request.job, observable, labels, metadata
+            publish_trajectory(request.root, request.job, observable, labels, metadata)
+            hashes = verify_trajectory_pair(
+                request.root,
+                request.job,
+                resolved_config_hash=_resolved_config_hash(request.spec),
             )
-            return TrajectoryResult.complete(
-                request.job, verify_artifact(observable_path), verify_artifact(label_path)
-            )
+            if hashes is None:
+                raise ArtifactConflict("published artifact pair is missing")
+            return TrajectoryResult.complete(request.job, *hashes)
         except (InvalidPhysicalPath, InvalidCircuit, ArtifactConflict) as error:
             last_error = error
     if isinstance(last_error, InvalidPhysicalPath):
@@ -1507,6 +1533,7 @@ def _manifest_payload(
     ordered = [results[key] for key in sorted(results)]
     return {
         "schema_version": 1,
+        "resolved_config_hash": _resolved_config_hash(spec),
         "generation": {
             "trajectories_per_condition": spec.trajectories_per_condition,
             "burn_in_rounds": spec.burn_in_rounds,
@@ -1519,6 +1546,7 @@ def _manifest_payload(
                 "completed": result.completed,
                 "observable_hash": result.observable_hash,
                 "label_hash": result.label_hash,
+                "pair_id": result.pair_id,
                 "failure": None
                 if result.failure is None
                 else {
@@ -1554,12 +1582,16 @@ def _run_manifest(
     )
 
 
-def _previous_failures(manifest_path: Path) -> Mapping[tuple[str, int], TrajectoryResult]:
+def _previous_failures(
+    manifest_path: Path, resolved_config_hash: str
+) -> Mapping[tuple[str, int], TrajectoryResult]:
     if not manifest_path.exists():
         return MappingProxyType({})
     document = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(document, Mapping) or not isinstance(document.get("results"), list):
         raise TypeError("invalid run manifest")
+    if document.get("resolved_config_hash") != resolved_config_hash:
+        return MappingProxyType({})
     failures: dict[tuple[str, int], TrajectoryResult] = {}
     for item in document["results"]:
         if (
@@ -1592,6 +1624,39 @@ def _previous_failures(manifest_path: Path) -> Mapping[tuple[str, int], Trajecto
     return MappingProxyType(failures)
 
 
+def _previous_completed(
+    manifest_path: Path, resolved_config_hash: str
+) -> Mapping[tuple[str, int], tuple[str, str, str] | None]:
+    if not manifest_path.exists():
+        return MappingProxyType({})
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(document, Mapping) or not isinstance(document.get("results"), list):
+        raise TypeError("invalid run manifest")
+    if document.get("resolved_config_hash") != resolved_config_hash:
+        return MappingProxyType({})
+    completed: dict[tuple[str, int], tuple[str, str, str] | None] = {}
+    for item in document["results"]:
+        if not isinstance(item, Mapping) or item.get("completed") is not True:
+            continue
+        condition_id, trajectory_id = item.get("condition_id"), item.get("trajectory_id")
+        observable_hash, label_hash, pair_id = (
+            item.get("observable_hash"),
+            item.get("label_hash"),
+            item.get("pair_id"),
+        )
+        if isinstance(condition_id, str) and isinstance(trajectory_id, int):
+            completed[(condition_id, trajectory_id)] = (
+                (observable_hash, label_hash, pair_id)
+                if (
+                    isinstance(observable_hash, str)
+                    and isinstance(label_hash, str)
+                    and isinstance(pair_id, str)
+                )
+                else None
+            )
+    return MappingProxyType(completed)
+
+
 def generate_matrix(
     spec: PocSpec, jobs: Sequence[TrajectoryJob], root: Path, *, workers: int
 ) -> RunManifest:
@@ -1600,7 +1665,8 @@ def generate_matrix(
         raise ValueError("workers must be positive")
     manifest_path = root / "run_manifest.json"
     config_hash = _resolved_config_hash(spec)
-    previous = _previous_failures(manifest_path)
+    previous = _previous_failures(manifest_path, config_hash)
+    previous_completed = _previous_completed(manifest_path, config_hash)
     results: dict[tuple[str, int], TrajectoryResult] = {}
     requests: list[GenerationRequest] = []
     resumed = 0
@@ -1613,6 +1679,15 @@ def generate_matrix(
             )
             continue
         if hashes is not None:
+            prior_hashes = previous_completed.get((job.condition_id, job.trajectory_id))
+            if (
+                job.condition_id,
+                job.trajectory_id,
+            ) in previous_completed and prior_hashes != hashes:
+                results[(job.condition_id, job.trajectory_id)] = TrajectoryResult.failed(
+                    job, FailureCode.ARTIFACT_CONFLICT, "manifest pair identity mismatch"
+                )
+                continue
             results[(job.condition_id, job.trajectory_id)] = TrajectoryResult.complete(job, *hashes)
             resumed += 1
         elif (job.condition_id, job.trajectory_id) in previous:

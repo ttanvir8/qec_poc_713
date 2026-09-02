@@ -40,21 +40,27 @@ def _sealed_jobs(spec: PocSpec, private_path: Path, output_root: Path) -> tuple[
 
 
 def _freeze_sealed(spec: PocSpec, private_path: Path, output_root: Path) -> str:
-    if private_path.exists():
-        raise FileExistsError(f"sealed manifest exists: {private_path}")
     commitment_path = _sealed_commitment_path(spec, output_root)
-    if commitment_path.exists():
-        raise FileExistsError(f"sealed commitment exists: {commitment_path}")
     private_path.parent.mkdir(parents=True, exist_ok=True)
-    private_path.write_bytes(
-        json.dumps(
-            {"root_seed": int.from_bytes(secrets.token_bytes(32), "big")},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    )
-    os.chmod(private_path, 0o600)
-    return write_sealed_commitment(private_path, commitment_path)
+    descriptor = os.open(private_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(
+                json.dumps(
+                    {"root_seed": int.from_bytes(secrets.token_bytes(32), "big")},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        return write_sealed_commitment(private_path, commitment_path)
+    except BaseException:
+        try:
+            private_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _existing_jobs(spec: PocSpec, output_root: Path) -> tuple[PocSpec, tuple[TrajectoryJob, ...]]:
