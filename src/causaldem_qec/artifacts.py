@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -32,6 +33,17 @@ _RENAME_EXCHANGE = 2
 
 class ArtifactConflict(FileExistsError, ValueError):
     """A complete artifact pair already exists but cannot be safely reused."""
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointPair:
+    """A manifest-committed artifact pair safe to include in a checkpoint."""
+
+    relative_path: Path
+    label_relative_path: Path
+    observable_hash: str
+    label_hash: str
+    pair_id: str
 
 
 def _json_value(value: object) -> object:
@@ -547,6 +559,257 @@ def verify_trajectory_pair(
     ):
         raise ArtifactConflict("artifact pair configuration mismatch")
     return observable_hash, label_hash, str(observable_metadata["pair_id"])
+
+
+def _checkpoint_lane_index(
+    root: Path, lane: Literal["observable", "labels"]
+) -> dict[tuple[str, int], Path]:
+    lane_root = root / "data" / lane
+    if not lane_root.exists():
+        return {}
+    indexed: dict[tuple[str, int], Path] = {}
+    for path in sorted(lane_root.glob("*/*/*")):
+        relative = path.relative_to(lane_root)
+        if (
+            not path.is_dir()
+            or path.is_symlink()
+            or any(part.startswith(".") for part in relative.parts)
+            or any(part.lower() in {"secret", "secrets", "staging"} for part in relative.parts)
+        ):
+            continue
+        _split, condition_id, trajectory = relative.parts
+        try:
+            trajectory_id = int(trajectory)
+        except ValueError:
+            continue
+        key = condition_id, trajectory_id
+        if key in indexed:
+            raise ArtifactConflict(
+                f"duplicate checkpoint artifact pair: {condition_id}:{trajectory_id}"
+            )
+        indexed[key] = path
+    return indexed
+
+
+def _checkpoint_manifest(root: Path) -> Mapping[str, object]:
+    try:
+        value: object = json.loads((root / "run_manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ArtifactConflict("invalid checkpoint manifest") from error
+    if not isinstance(value, Mapping) or not isinstance(value.get("results"), list):
+        raise ArtifactConflict("invalid checkpoint manifest")
+    try:
+        _reject_raw_seed_metadata(value)
+    except ValueError as error:
+        raise ArtifactConflict("checkpoint manifest contains raw seed data") from error
+    return value
+
+
+def _verified_checkpoint_pair(
+    root: Path,
+    observable_path: Path,
+    label_path: Path,
+    result: Mapping[str, object],
+    resolved_config_hash: str,
+) -> CheckpointPair:
+    try:
+        observable_hash = verify_artifact(observable_path)
+        label_hash = verify_artifact(label_path)
+        observable_metadata = _read_verified_metadata(observable_path)
+        label_metadata = _read_verified_metadata(label_path)
+        _reject_raw_seed_metadata(observable_metadata)
+        _reject_raw_seed_metadata(label_metadata)
+    except (OSError, TypeError, ValueError) as error:
+        raise ArtifactConflict("checkpoint artifact verification failed") from error
+    observable_relative = observable_path.relative_to(root)
+    label_relative = label_path.relative_to(root)
+    observable_lane_relative = observable_relative.relative_to(Path("data", "observable"))
+    label_lane_relative = label_relative.relative_to(Path("data", "labels"))
+    expected_job = observable_metadata.get("job")
+    observable_run = observable_metadata.get("metadata")
+    label_run = label_metadata.get("metadata")
+    pair_id = observable_metadata.get("pair_id")
+    if (
+        observable_lane_relative != label_lane_relative
+        or observable_metadata.get("artifact_kind") != "observable"
+        or label_metadata.get("artifact_kind") != "labels"
+        or not isinstance(expected_job, Mapping)
+        or label_metadata.get("job") != expected_job
+        or expected_job.get("split") != observable_lane_relative.parts[0]
+        or expected_job.get("condition_id") != result.get("condition_id")
+        or expected_job.get("trajectory_id") != result.get("trajectory_id")
+        or not isinstance(pair_id, str)
+        or label_metadata.get("pair_id") != pair_id
+        or not isinstance(observable_run, Mapping)
+        or observable_run != label_run
+        or observable_run.get("resolved_config_hash") != resolved_config_hash
+        or result.get("observable_hash") != observable_hash
+        or result.get("label_hash") != label_hash
+        or result.get("pair_id") != pair_id
+    ):
+        raise ArtifactConflict("checkpoint artifact pair identity mismatch")
+    return CheckpointPair(
+        relative_path=observable_relative,
+        label_relative_path=label_relative,
+        observable_hash=observable_hash,
+        label_hash=label_hash,
+        pair_id=pair_id,
+    )
+
+
+def inventory_checkpoint(root: Path) -> tuple[CheckpointPair, ...]:
+    """Return only manifest-committed, independently verified artifact pairs."""
+    manifest = _checkpoint_manifest(root)
+    resolved_config_hash = manifest.get("resolved_config_hash")
+    if not isinstance(resolved_config_hash, str) or not resolved_config_hash:
+        raise ArtifactConflict("invalid checkpoint manifest configuration")
+    observable_paths = _checkpoint_lane_index(root, "observable")
+    label_paths = _checkpoint_lane_index(root, "labels")
+    completed: dict[tuple[str, int], Mapping[str, object]] = {}
+    results = manifest["results"]
+    assert isinstance(results, list)
+    for value in results:
+        if not isinstance(value, Mapping):
+            raise ArtifactConflict("invalid checkpoint manifest result")
+        if value.get("completed") is not True:
+            continue
+        condition_id, trajectory_id = value.get("condition_id"), value.get("trajectory_id")
+        if (
+            not isinstance(condition_id, str)
+            or not condition_id
+            or isinstance(trajectory_id, bool)
+            or not isinstance(trajectory_id, int)
+        ):
+            raise ArtifactConflict("invalid completed checkpoint result")
+        key = condition_id, trajectory_id
+        if key in completed:
+            raise ArtifactConflict(
+                f"duplicate completed checkpoint result: {condition_id}:{trajectory_id}"
+            )
+        completed[key] = value
+    inventory: list[CheckpointPair] = []
+    for key in sorted(completed):
+        observable_path, label_path = observable_paths.get(key), label_paths.get(key)
+        if observable_path is None or label_path is None:
+            raise ArtifactConflict(f"incomplete checkpoint artifact pair: {key[0]}:{key[1]}")
+        inventory.append(
+            _verified_checkpoint_pair(
+                root,
+                observable_path,
+                label_path,
+                completed[key],
+                resolved_config_hash,
+            )
+        )
+    return tuple(inventory)
+
+
+_CHECKPOINT_ARTIFACT_FILES = ("arrays.npz", "metadata.json", "SHA256SUMS")
+
+
+def _checkpoint_file_set(inventory: Sequence[CheckpointPair]) -> set[Path]:
+    files = {Path("run_manifest.json")}
+    for pair in inventory:
+        for directory in (pair.relative_path, pair.label_relative_path):
+            files.update(directory / name for name in _CHECKPOINT_ARTIFACT_FILES)
+    return files
+
+
+def _copy_checkpoint_file(source: Path, target: Path) -> None:
+    if source.is_symlink() or not source.is_file():
+        raise ArtifactConflict(f"invalid checkpoint file: {source}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+    _fsync_file(target)
+
+
+def _checkpoint_export_matches(
+    source: Path,
+    destination: Path,
+    inventory: tuple[CheckpointPair, ...],
+) -> bool:
+    try:
+        if (destination / "run_manifest.json").read_bytes() != (
+            source / "run_manifest.json"
+        ).read_bytes():
+            return False
+        if inventory_checkpoint(destination) != inventory:
+            return False
+        actual_files = {
+            path.relative_to(destination) for path in destination.rglob("*") if path.is_file()
+        }
+        return actual_files == _checkpoint_file_set(inventory)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _publish_checkpoint_export(
+    staging: Path,
+    destination: Path,
+    source: Path,
+    inventory: tuple[CheckpointPair, ...],
+) -> None:
+    try:
+        _rename_no_replace(staging, destination)
+    except FileExistsError as error:
+        if _checkpoint_export_matches(source, destination, inventory):
+            shutil.rmtree(staging)
+            return
+        raise ArtifactConflict(f"checkpoint export conflict: {destination}") from error
+    except OSError as error:
+        if error.errno != errno.EINVAL:
+            raise
+        lock_path = destination.with_name(f".{destination.name}.publish.lock")
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as lock_error:
+            raise ArtifactConflict(
+                f"checkpoint export publication is busy: {destination}"
+            ) from lock_error
+        try:
+            os.close(descriptor)
+            if destination.exists():
+                if _checkpoint_export_matches(source, destination, inventory):
+                    shutil.rmtree(staging)
+                    return
+                raise ArtifactConflict(f"checkpoint export conflict: {destination}")
+            os.replace(staging, destination)
+        finally:
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+    _fsync_directory(destination.parent)
+
+
+def export_checkpoint(source: Path, destination: Path) -> Path:
+    """Atomically export a manifest and its verified artifact pairs."""
+    inventory = inventory_checkpoint(source)
+    if destination.exists():
+        if _checkpoint_export_matches(source, destination, inventory):
+            return destination
+        raise ArtifactConflict(f"checkpoint export conflict: {destination}")
+    staging = _staging_directory(destination)
+    try:
+        _copy_checkpoint_file(source / "run_manifest.json", staging / "run_manifest.json")
+        for pair in inventory:
+            for relative in (pair.relative_path, pair.label_relative_path):
+                for name in _CHECKPOINT_ARTIFACT_FILES:
+                    _copy_checkpoint_file(source / relative / name, staging / relative / name)
+        for directory in sorted(
+            (path for path in staging.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        ):
+            _fsync_directory(directory)
+        _fsync_directory(staging)
+        if inventory_checkpoint(staging) != inventory:
+            raise ArtifactConflict("checkpoint export verification mismatch")
+        _publish_checkpoint_export(staging, destination, source, inventory)
+        return destination
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
 
 
 def write_sealed_commitment(private_path: Path, commitment_path: Path) -> str:
