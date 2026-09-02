@@ -1661,16 +1661,35 @@ def _manifest_sealed_commitment(
 ) -> Mapping[str, str] | None:
     if provenance is None:
         return None
+    manifest_path = root / "run_manifest.json"
+    existing: Mapping[str, str] | None = None
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ArtifactConflict("invalid existing run manifest") from error
+        if not isinstance(manifest, Mapping):
+            raise ArtifactConflict("invalid existing run manifest")
+        manifest_commitment = manifest.get("sealed_commitment")
+        if manifest_commitment is not None:
+            existing = _validated_sealed_commitment(manifest_commitment)
     relative = spec.raw.get("sealed_commitment_path")
     if not isinstance(relative, str):
         raise ArtifactConflict("invalid sealed commitment path")
     path = root / relative
     if not path.exists():
-        return None
+        return existing
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ArtifactConflict("invalid sealed commitment") from error
+    supplied = _validated_sealed_commitment(value)
+    if existing is not None and supplied != existing:
+        raise ArtifactConflict("sealed commitment mismatch")
+    return supplied
+
+
+def _validated_sealed_commitment(value: object) -> Mapping[str, str]:
     digest = value.get("digest") if isinstance(value, Mapping) else None
     if (
         not isinstance(value, Mapping)

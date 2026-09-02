@@ -574,6 +574,7 @@ def test_nonsealed_bounded_resume_preserves_verified_sealed_manifest_entry(
         execution_options=options,
         provenance=provenance,
     )
+    commitment.unlink()
     resumed = generate_matrix(
         spec,
         (nonsealed_job,),
@@ -591,10 +592,58 @@ def test_nonsealed_bounded_resume_preserves_verified_sealed_manifest_entry(
     }
     assert sealed.completed == 1
     assert resumed.completed == 2
+    assert document["sealed_commitment"] == {
+        "algorithm": "sha256",
+        "digest": "c" * 64,
+    }
     assert completed_keys == {
         (sealed_job.condition_id, sealed_job.trajectory_id),
         (nonsealed_job.condition_id, nonsealed_job.trajectory_id),
     }
+
+
+def test_bounded_resume_rejects_a_new_disagreeing_sealed_commitment(
+    tmp_path: Path,
+) -> None:
+    spec = _tiny_pilot_spec()
+    options, provenance = _kaggle_execution()
+    all_jobs = expand_jobs(spec, include_sealed=True)
+    sealed_job = next(job for job in all_jobs if job.split == "sealed_test")
+    nonsealed_job = next(job for job in all_jobs if job.split != "sealed_test")
+    commitment = tmp_path / "data" / "manifests" / "sealed_commitment.json"
+    commitment.parent.mkdir(parents=True)
+    commitment.write_text(json.dumps({"algorithm": "sha256", "digest": "c" * 64}), encoding="utf-8")
+    generate_matrix(
+        spec,
+        (sealed_job,),
+        tmp_path,
+        workers=1,
+        execution_options=options,
+        provenance=provenance,
+    )
+    manifest_path = tmp_path / "run_manifest.json"
+    original_manifest = manifest_path.read_bytes()
+    commitment.write_text(json.dumps({"algorithm": "sha256", "digest": "d" * 64}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="sealed commitment mismatch"):
+        generate_matrix(
+            spec,
+            (nonsealed_job,),
+            tmp_path,
+            workers=1,
+            execution_options=options,
+            provenance=provenance,
+        )
+
+    assert manifest_path.read_bytes() == original_manifest
+    assert not (
+        tmp_path
+        / "data"
+        / "observable"
+        / nonsealed_job.split
+        / nonsealed_job.condition_id
+        / str(nonsealed_job.trajectory_id)
+    ).exists()
 
 
 def test_kaggle_manifest_binds_execution_identity_without_raw_seed(
