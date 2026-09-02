@@ -20,8 +20,10 @@ import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from causaldem_qec.core import (
     LabelTrajectory,
+    ManifestProvenance,
     ObservableTrajectory,
     TrajectoryJob,
+    deserialize_manifest_provenance,
     validate_labels,
     validate_observable,
 )
@@ -458,6 +460,20 @@ def _array(npz: Mapping[str, np.ndarray], name: str) -> np.ndarray:
 
 def _observable_from_npz(path: Path) -> ObservableTrajectory:
     with np.load(path, allow_pickle=False) as data:
+        if set(data.files) != {
+            "block",
+            "circuit_phase",
+            "detector_bits_packed",
+            "detector_role",
+            "detector_shape",
+            "detector_valid_packed",
+            "episode",
+            "global_round",
+            "logical_observable",
+            "max_source_round",
+            "round_in_episode",
+        }:
+            raise ValueError("observable artifact array schema mismatch")
         shape = _array(data, "detector_shape")
         if shape.shape != (2,) or shape.dtype != np.uint64:
             raise ValueError("invalid detector_shape")
@@ -492,6 +508,13 @@ def _observable_from_npz(path: Path) -> ObservableTrajectory:
 
 def _labels_from_npz(path: Path) -> LabelTrajectory:
     with np.load(path, allow_pickle=False) as data:
+        if set(data.files) != {
+            "class_probability",
+            "component_probability",
+            "future_block_probability",
+            "latent_factor",
+        }:
+            raise ValueError("label artifact array schema mismatch")
         labels = LabelTrajectory(
             component_probability=_array(data, "component_probability"),
             latent_factor=_array(data, "latent_factor"),
@@ -591,7 +614,12 @@ def _checkpoint_lane_index(
     return indexed
 
 
-def _checkpoint_manifest(root: Path) -> Mapping[str, object]:
+def _checkpoint_manifest(
+    root: Path,
+    *,
+    expected_config_hash: str | None,
+    expected_provenance: ManifestProvenance | None,
+) -> Mapping[str, object]:
     try:
         value: object = json.loads((root / "run_manifest.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -602,6 +630,21 @@ def _checkpoint_manifest(root: Path) -> Mapping[str, object]:
         _reject_raw_seed_metadata(value)
     except ValueError as error:
         raise ArtifactConflict("checkpoint manifest contains raw seed data") from error
+    try:
+        provenance = deserialize_manifest_provenance(value.get("provenance"))
+    except (KeyError, TypeError, ValueError) as error:
+        raise ArtifactConflict("checkpoint manifest identity is invalid") from error
+    config_hash = value.get("resolved_config_hash")
+    if (
+        value.get("schema_version") != 1
+        or value.get("dataset_profile") != "pilot"
+        or not _is_sha256_digest(config_hash)
+        or provenance.execution_backend != "kaggle"
+        or provenance.checkpoint_identity is None
+        or (expected_config_hash is not None and config_hash != expected_config_hash)
+        or (expected_provenance is not None and provenance != expected_provenance)
+    ):
+        raise ArtifactConflict("checkpoint manifest identity mismatch")
     return value
 
 
@@ -611,6 +654,7 @@ def _verified_checkpoint_pair(
     label_path: Path,
     result: Mapping[str, object],
     resolved_config_hash: str,
+    dataset_profile: str,
 ) -> CheckpointPair:
     try:
         observable_hash = verify_artifact(observable_path)
@@ -621,6 +665,11 @@ def _verified_checkpoint_pair(
         _reject_raw_seed_metadata(label_metadata)
     except (OSError, TypeError, ValueError) as error:
         raise ArtifactConflict("checkpoint artifact verification failed") from error
+    try:
+        load_observable(observable_path)
+        load_labels(label_path, purpose="offline_evaluation")
+    except (OSError, TypeError, ValueError) as error:
+        raise ArtifactConflict("checkpoint artifact schema validation failed") from error
     observable_relative = observable_path.relative_to(root)
     label_relative = label_path.relative_to(root)
     observable_lane_relative = observable_relative.relative_to(Path("data", "observable"))
@@ -643,6 +692,7 @@ def _verified_checkpoint_pair(
         or not isinstance(observable_run, Mapping)
         or observable_run != label_run
         or observable_run.get("resolved_config_hash") != resolved_config_hash
+        or observable_run.get("dataset_profile") != dataset_profile
         or result.get("observable_hash") != observable_hash
         or result.get("label_hash") != label_hash
         or result.get("pair_id") != pair_id
@@ -657,9 +707,18 @@ def _verified_checkpoint_pair(
     )
 
 
-def inventory_checkpoint(root: Path) -> tuple[CheckpointPair, ...]:
+def inventory_checkpoint(
+    root: Path,
+    *,
+    expected_config_hash: str | None = None,
+    expected_provenance: ManifestProvenance | None = None,
+) -> tuple[CheckpointPair, ...]:
     """Return only manifest-committed, independently verified artifact pairs."""
-    manifest = _checkpoint_manifest(root)
+    manifest = _checkpoint_manifest(
+        root,
+        expected_config_hash=expected_config_hash,
+        expected_provenance=expected_provenance,
+    )
     resolved_config_hash = manifest.get("resolved_config_hash")
     if not isinstance(resolved_config_hash, str) or not resolved_config_hash:
         raise ArtifactConflict("invalid checkpoint manifest configuration")
@@ -699,8 +758,23 @@ def inventory_checkpoint(root: Path) -> tuple[CheckpointPair, ...]:
                 label_path,
                 completed[key],
                 resolved_config_hash,
+                "pilot",
             )
         )
+    sealed_commitment = manifest.get("sealed_commitment")
+    has_sealed_pairs = any(pair.relative_path.parts[2] == "sealed_test" for pair in inventory)
+    if sealed_commitment is not None and not _is_sha256_commitment(sealed_commitment):
+        raise ArtifactConflict("checkpoint sealed commitment is invalid")
+    if has_sealed_pairs and not _is_sha256_commitment(sealed_commitment):
+        raise ArtifactConflict("checkpoint sealed commitment is required")
+    commitment_path = root / "data" / "manifests" / "sealed_commitment.json"
+    if commitment_path.exists():
+        try:
+            source_commitment = json.loads(commitment_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ArtifactConflict("checkpoint sealed commitment is invalid") from error
+        if source_commitment != sealed_commitment:
+            raise ArtifactConflict("checkpoint sealed commitment mismatch")
     return tuple(inventory)
 
 
@@ -729,15 +803,18 @@ def _checkpoint_export_matches(
     inventory: tuple[CheckpointPair, ...],
 ) -> bool:
     try:
+        if destination.is_symlink() or not destination.is_dir():
+            return False
+        entries = tuple(destination.rglob("*"))
+        if any(path.is_symlink() or not (path.is_file() or path.is_dir()) for path in entries):
+            return False
         if (destination / "run_manifest.json").read_bytes() != (
             source / "run_manifest.json"
         ).read_bytes():
             return False
         if inventory_checkpoint(destination) != inventory:
             return False
-        actual_files = {
-            path.relative_to(destination) for path in destination.rglob("*") if path.is_file()
-        }
+        actual_files = {path.relative_to(destination) for path in entries if path.is_file()}
         return actual_files == _checkpoint_file_set(inventory)
     except (OSError, TypeError, ValueError):
         return False
@@ -782,9 +859,19 @@ def _publish_checkpoint_export(
     _fsync_directory(destination.parent)
 
 
-def export_checkpoint(source: Path, destination: Path) -> Path:
+def export_checkpoint(
+    source: Path,
+    destination: Path,
+    *,
+    expected_config_hash: str | None = None,
+    expected_provenance: ManifestProvenance | None = None,
+) -> Path:
     """Atomically export a manifest and its verified artifact pairs."""
-    inventory = inventory_checkpoint(source)
+    inventory = inventory_checkpoint(
+        source,
+        expected_config_hash=expected_config_hash,
+        expected_provenance=expected_provenance,
+    )
     if destination.exists():
         if _checkpoint_export_matches(source, destination, inventory):
             return destination
