@@ -259,6 +259,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.reports_root,
             sample_seed=spec.public_root_seed,
             chunk_rounds=spec.chunk_rounds,
+            gate_results=gates,
         )
         print(json.dumps({"scientific_status": "PILOT / NOT FINAL", "sections": index.sections}))
         return 0

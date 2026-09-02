@@ -97,7 +97,7 @@ def _manifest(root: Path) -> Mapping[str, object]:
     return MappingProxyType(value)
 
 
-def _pairs(root: Path) -> tuple[_Pair, ...]:
+def _pairs(root: Path, manifest: Mapping[str, object]) -> tuple[_Pair, ...]:
     pairs: list[_Pair] = []
     for observable in sorted((root / "data" / "observable").glob("*/*/*")):
         if not observable.is_dir():
@@ -123,6 +123,16 @@ def _pairs(root: Path) -> tuple[_Pair, ...]:
             )
         )
     validate_inventory([(pair.condition_id, pair.trajectory_id) for pair in pairs])
+    results = manifest.get("results")
+    if (
+        not isinstance(results, list)
+        or any(
+            not isinstance(result, Mapping) or result.get("completed") is not True
+            for result in results
+        )
+        or len(results) != len(pairs)
+    ):
+        raise ValueError("pilot EDA requires a complete pilot root")
     if not pairs:
         raise ValueError("pilot EDA requires at least one verified trajectory")
     return tuple(pairs)
@@ -245,20 +255,39 @@ def render_data_card(
 
 
 def render_validation_report(
-    output_root: Path, *, profile_hash: str, inventory: Mapping[str, object]
+    output_root: Path,
+    *,
+    profile_hash: str,
+    inventory: Mapping[str, object],
+    gate_results: Sequence[object] = (),
 ) -> Path:
     path = output_root / "validation_report.json"
     gates: list[dict[str, object]] = []
+    by_id = {str(getattr(item, "gate_id", "")): item for item in gate_results}
     for number in range(1, 13):
         gate_id = f"DQ{number:02d}"
+        result = by_id.get(gate_id)
+        evidence = (
+            dict(getattr(result, "evidence", inventory)) if result is not None else dict(inventory)
+        )
         gates.append(
             {
                 "gate_id": gate_id,
-                "status": "not_run" if gate_id == "DQ08" else "pass",
-                "evidence": dict(inventory),
-                "thresholds": {},
-                "affected_conditions": [],
-                "failure_records": [],
+                "status": (
+                    "not_run"
+                    if gate_id == "DQ08" or result is None
+                    else str(getattr(getattr(result, "status", None), "value", "not_run"))
+                ),
+                "evidence": evidence,
+                "thresholds": {key: value for key, value in evidence.items() if "tolerance" in key},
+                "affected_conditions": list(getattr(result, "affected_conditions", ())),
+                "failure_records": []
+                if result is None
+                else (
+                    []
+                    if str(getattr(getattr(result, "status", None), "value", "")) == "pass"
+                    else [evidence]
+                ),
             }
         )
     _write_json(
@@ -274,10 +303,14 @@ def render_validation_report(
 
 
 def build_dataset_eda(
-    input_root: Path, output_root: Path, sample_seed: int, chunk_rounds: int = 4096
+    input_root: Path,
+    output_root: Path,
+    sample_seed: int,
+    chunk_rounds: int = 4096,
+    gate_results: Sequence[object] = (),
 ) -> EdaIndex:
     manifest = _manifest(input_root)
-    pairs = _pairs(input_root)
+    pairs = _pairs(input_root, manifest)
     output_root.mkdir(parents=True, exist_ok=True)
     profile_hash = str(manifest.get("resolved_config_hash", "unknown"))
     hashes = tuple(sorted(hash_value for pair in pairs for hash_value in pair.hashes))
@@ -287,7 +320,11 @@ def build_dataset_eda(
     }
     inventory: dict[str, object] = {
         "trajectories": len(pairs),
+        "circuits": sorted({pair.condition_id.split("__", maxsplit=1)[0] for pair in pairs}),
+        "conditions": sorted({pair.condition_id for pair in pairs}),
         "splits": splits,
+        "generation": manifest.get("generation", {}),
+        "schemas": ["observable-v1", "labels-v1"],
         "disk_bytes": sum(
             file.stat().st_size
             for pair in pairs
@@ -306,6 +343,8 @@ def build_dataset_eda(
         "classes": 0.0,
         "parity": 0.0,
         "theory": 0.0,
+        "queried": 0,
+        "block_theory": 0.0,
         "cov_pos": 0,
         "cov_neg": 0,
     }
@@ -320,9 +359,18 @@ def build_dataset_eda(
         valid = np.unpackbits(values["detector_valid_packed"], axis=1, bitorder="little")[
             :, :detector_count
         ].astype(bool)
-        parity = np.logical_xor.reduce(bits, axis=1).astype(float)
-        theory = 1.0 - np.prod(1.0 - values["class_probability"], axis=1)
-        totals["rounds"] += len(parity)
+        queried = np.all(valid, axis=1)
+        parity = np.logical_xor.reduce(bits[queried], axis=1).astype(float)
+        class_probability = values["class_probability"][queried]
+        # Exact XOR composition, not an OR probability.
+        theory = 0.5 * (1.0 - np.prod(1.0 - 2.0 * class_probability, axis=1))
+        block_theory = 0.0
+        for block in np.unique(values["block"][queried]):
+            block_probability = class_probability[values["block"][queried] == block].mean(axis=0)
+            block_theory += float(0.5 * (1.0 - np.prod(1.0 - 2.0 * block_probability))) * int(
+                np.count_nonzero(values["block"][queried] == block)
+            )
+        totals["rounds"] += len(values["global_round"])
         totals["valid"] += int(valid.sum())
         totals["detectors"] += valid.size
         totals["bits"] += int(bits.sum())
@@ -330,6 +378,8 @@ def build_dataset_eda(
         totals["classes"] += float(values["class_probability"].sum())
         totals["parity"] += float(parity.sum())
         totals["theory"] += float(theory.sum())
+        totals["block_theory"] += block_theory
+        totals["queried"] += len(parity)
         covariance = np.cov(bits.astype(float), rowvar=False) if len(bits) > 1 else np.zeros((2, 2))
         totals["cov_pos"] += int((covariance > 0).sum())
         totals["cov_neg"] += int((covariance < 0).sum())
@@ -349,7 +399,7 @@ def build_dataset_eda(
             sha256(f"{sample_seed}:{pair.condition_id}:{pair.trajectory_id}".encode()).digest()[:8],
             "big",
         )
-        if token % max(len(pairs), 1) == 0 or not sampled:
+        if (token % max(len(pairs), 1) == 0 or not sampled) and len(parity):
             sampled.append(parity)
     rounds = max(int(totals["rounds"]), 1)
     rates = {
@@ -357,8 +407,9 @@ def build_dataset_eda(
         "valid_rate": totals["valid"] / max(int(totals["detectors"]), 1),
         "mean_component_probability": totals["component"] / rounds,
         "mean_class_probability": totals["classes"] / rounds,
-        "empirical_parity": totals["parity"] / rounds,
-        "theoretical_parity": totals["theory"] / rounds,
+        "empirical_parity": totals["parity"] / max(int(totals["queried"]), 1),
+        "theoretical_parity": totals["theory"] / max(int(totals["queried"]), 1),
+        "block_average_theoretical_parity": totals["block_theory"] / max(int(totals["queried"]), 1),
         "mean_spectral_power": float(np.mean(spectra)) if spectra else 0.0,
         "mean_acf": float(np.mean(acfs)) if acfs else 0.0,
         "mean_pacf": float(np.mean(pacfs)) if pacfs else 0.0,
@@ -392,7 +443,8 @@ def build_dataset_eda(
             "theoretical": rates["theoretical_parity"],
         },
         "noncommutation_gap": {
-            "round_mean_minus_block_proxy": rates["empirical_parity"] - rates["theoretical_parity"]
+            "round_mean_minus_block_average": rates["theoretical_parity"]
+            - rates["block_average_theoretical_parity"]
         },
         "canonical_catalog": {
             "available_singular_spectra": False,
@@ -423,7 +475,9 @@ def build_dataset_eda(
             section in _TRUTH_SECTIONS, hashes, int(totals["rounds"]), path
         )
     render_data_card(output_root, profile_hash=profile_hash, inventory=inventory)
-    render_validation_report(output_root, profile_hash=profile_hash, inventory=inventory)
+    render_validation_report(
+        output_root, profile_hash=profile_hash, inventory=inventory, gate_results=gate_results
+    )
     return EdaIndex(
         DATASET_EDA_SECTIONS,
         _TRUTH_SECTIONS,
@@ -435,4 +489,11 @@ def build_dataset_eda(
 
 def display_eda(index: EdaIndex) -> EdaIndex:
     """Notebook presentation helper; all analysis remains in ``build_dataset_eda``."""
+    inventory = json.loads(
+        index.output_paths["inventory_and_integrity"].read_text(encoding="utf-8")
+    )
+    print(
+        f"PILOT / NOT FINAL — dataset-profile/config hash "
+        f"{inventory['dataset_profile_hash']}. Final claims require the deferred full production dataset."
+    )
     return index

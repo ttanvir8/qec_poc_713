@@ -53,7 +53,16 @@ def tiny_published_pilot(tmp_path: Path) -> Path:
             {"resolved_config_hash": "pilot-fixture", "dataset_profile": "pilot"},
         )
     (root / "run_manifest.json").write_text(
-        json.dumps({"dataset_profile": "pilot", "resolved_config_hash": "pilot-fixture"}),
+        json.dumps(
+            {
+                "dataset_profile": "pilot",
+                "resolved_config_hash": "pilot-fixture",
+                "results": [
+                    {"condition_id": "repetition_d3__f01", "trajectory_id": item, "completed": True}
+                    for item in range(2)
+                ],
+            }
+        ),
         encoding="utf-8",
     )
     return root
