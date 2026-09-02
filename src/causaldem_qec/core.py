@@ -14,6 +14,8 @@ import numpy as np
 
 Split = Literal["train", "validation", "id_test", "development", "sealed_test"]
 DatasetProfile = Literal["production", "pilot"]
+ExecutionBackend = Literal["local", "kaggle"]
+GenerationMode = Literal["standard", "bounded"]
 
 _REQUIRED_TOP_LEVEL_KEYS = frozenset(
     {
@@ -52,6 +54,135 @@ _COMPONENT_IDS = frozenset(
 )
 _EPISODE_ROUNDS = 32
 _BLOCK_ROUNDS = 256
+_EXECUTION_BACKENDS = frozenset({"local", "kaggle"})
+_GENERATION_MODES = frozenset({"standard", "bounded"})
+
+
+def _normalized_nonempty(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a nonempty string")
+    return value.strip()
+
+
+def normalize_execution_backend(value: object) -> ExecutionBackend:
+    """Return the canonical execution backend or reject an unsupported value."""
+    normalized = _normalized_nonempty(value, "execution backend").lower()
+    if normalized not in _EXECUTION_BACKENDS:
+        raise ValueError(f"unsupported execution backend: {value}")
+    return cast(ExecutionBackend, normalized)
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionOptions:
+    execution_backend: ExecutionBackend = "local"
+    job_limit: int | None = None
+    checkpoint_identity: str | None = None
+    generation_mode: GenerationMode = "standard"
+    generation_chunk_rounds: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "execution_backend", normalize_execution_backend(self.execution_backend)
+        )
+        if self.job_limit is not None and (
+            isinstance(self.job_limit, bool)
+            or not isinstance(self.job_limit, int)
+            or self.job_limit < 1
+        ):
+            raise ValueError("job limit must be a positive integer")
+        if self.checkpoint_identity is not None:
+            object.__setattr__(
+                self,
+                "checkpoint_identity",
+                _normalized_nonempty(self.checkpoint_identity, "checkpoint identity"),
+            )
+        mode = _normalized_nonempty(self.generation_mode, "generation mode").lower()
+        if mode not in _GENERATION_MODES:
+            raise ValueError(f"unsupported generation mode: {self.generation_mode}")
+        object.__setattr__(self, "generation_mode", cast(GenerationMode, mode))
+        if self.generation_chunk_rounds is not None and (
+            isinstance(self.generation_chunk_rounds, bool)
+            or not isinstance(self.generation_chunk_rounds, int)
+            or self.generation_chunk_rounds < 1
+        ):
+            raise ValueError("generation chunk rounds must be a positive integer")
+        if self.generation_mode == "standard" and self.generation_chunk_rounds is not None:
+            raise ValueError("generation chunk rounds require bounded generation mode")
+
+
+@dataclass(frozen=True, slots=True)
+class ManifestProvenance:
+    source_commit: str
+    execution_backend: ExecutionBackend
+    generation_law_version: str
+    checkpoint_identity: str | None
+    generation_mode: GenerationMode = "standard"
+    generation_chunk_rounds: int | None = None
+
+    def __post_init__(self) -> None:
+        options = ExecutionOptions(
+            execution_backend=self.execution_backend,
+            checkpoint_identity=self.checkpoint_identity,
+            generation_mode=self.generation_mode,
+            generation_chunk_rounds=self.generation_chunk_rounds,
+        )
+        object.__setattr__(
+            self, "source_commit", _normalized_nonempty(self.source_commit, "source commit")
+        )
+        object.__setattr__(self, "execution_backend", options.execution_backend)
+        object.__setattr__(
+            self,
+            "generation_law_version",
+            _normalized_nonempty(self.generation_law_version, "generation law version"),
+        )
+        object.__setattr__(self, "checkpoint_identity", options.checkpoint_identity)
+        object.__setattr__(self, "generation_mode", options.generation_mode)
+        object.__setattr__(self, "generation_chunk_rounds", options.generation_chunk_rounds)
+
+
+def serialize_manifest_provenance(provenance: ManifestProvenance) -> dict[str, object]:
+    """Convert immutable execution provenance into a JSON-safe manifest value."""
+    return {
+        "source_commit": provenance.source_commit,
+        "execution_backend": provenance.execution_backend,
+        "generation_law_version": provenance.generation_law_version,
+        "checkpoint_identity": provenance.checkpoint_identity,
+        "generation_mode": provenance.generation_mode,
+        "generation_chunk_rounds": provenance.generation_chunk_rounds,
+    }
+
+
+def deserialize_manifest_provenance(value: object) -> ManifestProvenance:
+    """Validate and restore a manifest's execution provenance section."""
+    provenance = _mapping(value, "manifest provenance")
+    _exact_keys(
+        provenance,
+        frozenset(
+            {
+                "source_commit",
+                "execution_backend",
+                "generation_law_version",
+                "checkpoint_identity",
+                "generation_mode",
+                "generation_chunk_rounds",
+            }
+        ),
+        "manifest provenance",
+    )
+    checkpoint_identity = provenance["checkpoint_identity"]
+    if checkpoint_identity is not None and not isinstance(checkpoint_identity, str):
+        raise ValueError("checkpoint identity must be a string or null")
+    generation_chunk_rounds = provenance["generation_chunk_rounds"]
+    return ManifestProvenance(
+        source_commit=_normalized_nonempty(provenance["source_commit"], "source commit"),
+        execution_backend=normalize_execution_backend(provenance["execution_backend"]),
+        generation_law_version=_normalized_nonempty(
+            provenance["generation_law_version"], "generation law version"
+        ),
+        checkpoint_identity=checkpoint_identity,
+        generation_mode=cast(GenerationMode, provenance["generation_mode"]),
+        generation_chunk_rounds=cast(int | None, generation_chunk_rounds),
+    )
 
 
 class FailureCode(StrEnum):
@@ -188,6 +319,7 @@ class RunManifest:
     trajectory_hashes: Mapping[str, tuple[str, str]]
     failures: tuple[TrajectoryFailure, ...]
     manifest_hash: str
+    provenance: ManifestProvenance | None = None
 
 
 def _require_array(

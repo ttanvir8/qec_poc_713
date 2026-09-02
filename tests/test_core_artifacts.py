@@ -2,7 +2,7 @@ import errno
 import json
 import shutil
 import stat
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -21,12 +21,17 @@ from causaldem_qec.artifacts import (
 from causaldem_qec.cli import _freeze_sealed
 from causaldem_qec.core import (
     CircuitSpec,
+    ExecutionOptions,
     LabelTrajectory,
+    ManifestProvenance,
     ObservableTrajectory,
+    RunManifest,
     TrajectoryJob,
     derive_seed,
+    deserialize_manifest_provenance,
     expand_jobs,
     load_spec,
+    serialize_manifest_provenance,
     source_cutoff,
     target_interval,
     validate_observable,
@@ -34,6 +39,90 @@ from causaldem_qec.core import (
 
 CONFIG = Path("configs/poc.json")
 PILOT_CONFIG = Path("configs/poc_pilot.json")
+
+
+def test_execution_options_are_frozen_and_normalize_the_backend() -> None:
+    options = ExecutionOptions(
+        execution_backend=" KAGGLE ",
+        job_limit=1,
+        checkpoint_identity="causaldem-pilot-checkpoint:7",
+        generation_mode="bounded",
+        generation_chunk_rounds=256,
+    )
+
+    assert options.execution_backend == "kaggle"
+    with pytest.raises(FrozenInstanceError):
+        options.job_limit = 2  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("backend", ["", "remote", "kaggle-gpu"])
+def test_execution_options_reject_unknown_backends(backend: str) -> None:
+    with pytest.raises(ValueError, match="execution backend"):
+        ExecutionOptions(execution_backend=backend)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"job_limit": 0},
+        {"checkpoint_identity": " "},
+        {"generation_mode": "streaming"},
+        {"generation_chunk_rounds": 256},
+        {"generation_mode": "bounded", "generation_chunk_rounds": 0},
+    ],
+)
+def test_execution_options_reject_invalid_limits_and_bounded_settings(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        ExecutionOptions(**overrides)  # type: ignore[arg-type]
+
+
+def test_manifest_provenance_round_trips_without_raw_seed_fields() -> None:
+    provenance = ManifestProvenance(
+        source_commit="1440540b725772582122235ccf845f4f62347ad6",
+        execution_backend="KAGGLE",
+        generation_law_version="standard_monolithic_v1",
+        checkpoint_identity="causaldem-pilot-checkpoint:7",
+        generation_mode="bounded",
+        generation_chunk_rounds=256,
+    )
+
+    encoded = serialize_manifest_provenance(provenance)
+    decoded = deserialize_manifest_provenance(json.loads(json.dumps(encoded)))
+
+    assert decoded == provenance
+    assert encoded == {
+        "source_commit": "1440540b725772582122235ccf845f4f62347ad6",
+        "execution_backend": "kaggle",
+        "generation_law_version": "standard_monolithic_v1",
+        "checkpoint_identity": "causaldem-pilot-checkpoint:7",
+        "generation_mode": "bounded",
+        "generation_chunk_rounds": 256,
+    }
+    assert "seed" not in json.dumps(encoded).lower()
+
+
+def test_manifest_provenance_rejects_raw_seed_fields() -> None:
+    encoded = serialize_manifest_provenance(
+        ManifestProvenance(
+            source_commit="1440540b725772582122235ccf845f4f62347ad6",
+            execution_backend="kaggle",
+            generation_law_version="standard_monolithic_v1",
+            checkpoint_identity=None,
+            generation_mode="standard",
+            generation_chunk_rounds=None,
+        )
+    )
+
+    with pytest.raises(ValueError, match="unknown manifest provenance keys"):
+        deserialize_manifest_provenance({**encoded, "root_seed": 713})
+
+
+def test_run_manifest_keeps_provenance_optional_for_existing_callers() -> None:
+    manifest = RunManifest(0, 0, 0, MappingProxyType({}), (), "manifest-hash")
+
+    assert manifest.provenance is None
 
 
 def _modified_config(
