@@ -5,16 +5,26 @@ import json
 import os
 import secrets
 import shutil
+import subprocess
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
 from causaldem_qec.artifacts import load_sealed_seed, write_sealed_commitment
-from causaldem_qec.core import PocSpec, TrajectoryJob, expand_jobs, load_spec
+from causaldem_qec.core import (
+    ExecutionOptions,
+    ManifestProvenance,
+    PocSpec,
+    TrajectoryJob,
+    expand_jobs,
+    load_spec,
+)
 from causaldem_qec.report import build_dataset_eda
 from causaldem_qec.simulate import (
+    STANDARD_GENERATION_LAW_VERSION,
     GateStatus,
     assert_run_manifest_identity,
+    generate_bounded_checkpoint,
     generate_matrix,
     verify_dataset,
 )
@@ -42,6 +52,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=Path("configs/poc.json"))
     parser.add_argument("--output-root", type=Path, default=Path("."))
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--execution-backend", choices=("local", "kaggle"), default="local")
+    parser.add_argument("--job-limit", type=int)
+    parser.add_argument("--checkpoint-root", type=Path)
     parser.add_argument("--sealed-manifest", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--reports-root", type=Path, default=Path("reports/dataset_eda"))
@@ -149,6 +162,70 @@ def _pilot_preflight(output_root: Path, spec: PocSpec) -> int:
     return free
 
 
+def _source_commit() -> str:
+    repository = Path(__file__).resolve().parents[2]
+    commit_file = repository / "COMMIT_SHA.txt"
+    if commit_file.is_file():
+        value = commit_file.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("cannot determine source commit") from error
+
+
+def _path_contains(parent: Path, child: Path) -> bool:
+    parent, child = parent.resolve(), child.resolve()
+    return parent == child or parent in child.parents
+
+
+def _execution_context(
+    args: argparse.Namespace, spec: PocSpec
+) -> tuple[ExecutionOptions, ManifestProvenance | None]:
+    options = ExecutionOptions(
+        execution_backend=args.execution_backend,
+        job_limit=args.job_limit,
+        checkpoint_identity=(
+            f"checkpoint-root:{args.checkpoint_root.resolve()}"
+            if args.checkpoint_root is not None
+            else None
+        ),
+    )
+    if options.execution_backend == "local":
+        if args.job_limit is not None or args.checkpoint_root is not None:
+            raise ValueError("--job-limit and --checkpoint-root require --execution-backend kaggle")
+        return options, None
+    if args.stage != "generate-pilot" or spec.dataset_profile != "pilot":
+        raise ValueError("kaggle execution is supported only for generate-pilot")
+    if options.job_limit is None or args.checkpoint_root is None:
+        raise ValueError("kaggle execution requires --job-limit and --checkpoint-root")
+    if args.workers != 1:
+        raise ValueError("kaggle execution requires --workers 1")
+    if _path_contains(args.output_root, args.checkpoint_root) or _path_contains(
+        args.checkpoint_root, args.output_root
+    ):
+        raise ValueError("checkpoint root must be separate from the output root")
+    if args.sealed_manifest is not None and (
+        _path_contains(args.checkpoint_root, args.sealed_manifest)
+        or _path_contains(args.output_root, args.sealed_manifest)
+    ):
+        raise ValueError("private sealed manifest must be outside output and checkpoint roots")
+    provenance = ManifestProvenance(
+        source_commit=_source_commit(),
+        execution_backend="kaggle",
+        generation_law_version=STANDARD_GENERATION_LAW_VERSION,
+        checkpoint_identity=options.checkpoint_identity,
+    )
+    return options, provenance
+
+
 def _pilot_status(
     spec: PocSpec,
     jobs: tuple[TrajectoryJob, ...],
@@ -156,6 +233,8 @@ def _pilot_status(
     free_bytes: int,
     dry_run: bool,
     manifest: str | None,
+    execution_options: ExecutionOptions | None = None,
+    checkpoint_root: Path | None = None,
 ) -> dict[str, object]:
     allocation: dict[str, list[dict[str, str | int]]] = {
         partition: [] for partition in ("normal", "development", "sealed")
@@ -173,7 +252,7 @@ def _pilot_status(
                 "split": job.split,
             }
         )
-    return {
+    status: dict[str, object] = {
         "dataset_profile": spec.dataset_profile,
         "scientific_status": "PILOT_NOT_FINAL",
         "total_jobs": len(expand_jobs(spec, include_sealed=True)),
@@ -189,11 +268,23 @@ def _pilot_status(
         "dry_run": dry_run,
         "manifest_hash": manifest,
     }
+    if execution_options is not None:
+        status.update(
+            {
+                "execution_backend": execution_options.execution_backend,
+                "job_limit": execution_options.job_limit,
+                "checkpoint_root": None
+                if checkpoint_root is None
+                else str(checkpoint_root.resolve()),
+            }
+        )
+    return status
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     spec = load_spec(args.config)
+    execution_options, provenance = _execution_context(args, spec)
     if args.stage == "freeze-sealed":
         if args.sealed_manifest is None:
             raise ValueError("freeze-sealed requires --sealed-manifest")
@@ -217,7 +308,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.stage == "generate-pilot":
         _require_pilot_config(args.config, spec)
-        free_bytes = _pilot_preflight(args.output_root, spec)
+        if execution_options.execution_backend == "kaggle":
+            assert_run_manifest_identity(args.output_root, spec, provenance)
+            probe = args.output_root.resolve()
+            while not probe.exists():
+                probe = probe.parent
+            free_bytes = shutil.disk_usage(probe).free
+        else:
+            free_bytes = _pilot_preflight(args.output_root, spec)
         jobs = (
             _sealed_jobs(spec, args.sealed_manifest, args.output_root)
             if args.sealed_manifest is not None
@@ -226,11 +324,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.dry_run:
             print(
                 json.dumps(
-                    _pilot_status(spec, jobs, free_bytes=free_bytes, dry_run=True, manifest=None)
+                    _pilot_status(
+                        spec,
+                        jobs,
+                        free_bytes=free_bytes,
+                        dry_run=True,
+                        manifest=None,
+                        execution_options=execution_options,
+                        checkpoint_root=args.checkpoint_root,
+                    )
                 )
             )
             return 0
-        manifest = generate_matrix(spec, jobs, args.output_root, workers=args.workers)
+        if execution_options.execution_backend == "kaggle":
+            assert args.checkpoint_root is not None
+            assert provenance is not None
+            manifest = generate_bounded_checkpoint(
+                spec,
+                jobs,
+                args.output_root,
+                args.checkpoint_root,
+                workers=args.workers,
+                execution_options=execution_options,
+                provenance=provenance,
+            )
+        else:
+            manifest = generate_matrix(spec, jobs, args.output_root, workers=args.workers)
         print(
             json.dumps(
                 _pilot_status(
@@ -239,6 +358,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     free_bytes=free_bytes,
                     dry_run=False,
                     manifest=manifest.manifest_hash,
+                    execution_options=execution_options,
+                    checkpoint_root=args.checkpoint_root,
                 )
             )
         )

@@ -9,7 +9,14 @@ import pytest
 import stim
 
 from causaldem_qec.cli import main
-from causaldem_qec.core import CircuitSpec, TrajectoryJob, expand_jobs, load_spec
+from causaldem_qec.core import (
+    CircuitSpec,
+    ExecutionOptions,
+    ManifestProvenance,
+    TrajectoryJob,
+    expand_jobs,
+    load_spec,
+)
 from causaldem_qec.simulate import (
     NOISE_KIND,
     AuditContext,
@@ -22,9 +29,11 @@ from causaldem_qec.simulate import (
     canonicalize_test_dem,
     component_layout,
     dataset_gates_complete,
+    generate_bounded_checkpoint,
     generate_dynamics,
     generate_matrix,
     run_dataset_gates,
+    select_incomplete_jobs,
     xor_compose,
 )
 
@@ -474,6 +483,166 @@ def test_resume_skips_only_verified_complete_trajectory(tiny_spec, tmp_path: Pat
     second = generate_matrix(tiny_spec, jobs, tmp_path, workers=1)
     assert second.generated == 0
     assert second.resumed == first.completed
+
+
+def test_incomplete_jobs_are_selected_in_stable_sorted_order(tiny_spec) -> None:
+    jobs = expand_jobs(tiny_spec, include_sealed=False)
+    selected = select_incomplete_jobs(
+        tuple(reversed(jobs)),
+        completed_job_keys={(jobs[1].condition_id, jobs[1].trajectory_id)},
+        job_limit=1,
+    )
+
+    assert selected == (jobs[0],)
+
+
+def _tiny_pilot_spec():
+    spec = load_spec(Path("configs/poc_pilot.json"))
+    return replace(spec, burn_in_rounds=32, scored_rounds=256)
+
+
+def _kaggle_execution() -> tuple[ExecutionOptions, ManifestProvenance]:
+    options = ExecutionOptions(
+        execution_backend="kaggle",
+        job_limit=1,
+        checkpoint_identity="pilot-checkpoint:test",
+    )
+    provenance = ManifestProvenance(
+        source_commit="task-3-test",
+        execution_backend="kaggle",
+        generation_law_version="standard_monolithic_v1",
+        checkpoint_identity="pilot-checkpoint:test",
+    )
+    return options, provenance
+
+
+def test_bounded_generation_is_deterministic_across_clean_and_resumed_runs(
+    tmp_path: Path,
+) -> None:
+    spec = _tiny_pilot_spec()
+    jobs = expand_jobs(spec, include_sealed=False)[:2]
+    options, provenance = _kaggle_execution()
+
+    first = generate_matrix(
+        spec,
+        tuple(reversed(jobs)),
+        tmp_path / "resumed",
+        workers=1,
+        execution_options=options,
+        provenance=provenance,
+    )
+    second = generate_matrix(
+        spec,
+        tuple(reversed(jobs)),
+        tmp_path / "resumed",
+        workers=1,
+        execution_options=options,
+        provenance=provenance,
+    )
+    clean = generate_matrix(
+        spec,
+        tuple(reversed(jobs)),
+        tmp_path / "clean",
+        workers=1,
+        execution_options=replace(options, job_limit=2),
+        provenance=provenance,
+    )
+
+    assert first.generated == 1
+    assert second.generated == 1
+    assert second.resumed == 1
+    assert second.trajectory_hashes == clean.trajectory_hashes
+
+
+def test_kaggle_manifest_binds_execution_identity_without_raw_seed(
+    tmp_path: Path,
+) -> None:
+    spec = _tiny_pilot_spec()
+    options, provenance = _kaggle_execution()
+    generate_matrix(
+        spec,
+        expand_jobs(spec, include_sealed=False)[:1],
+        tmp_path,
+        workers=1,
+        execution_options=options,
+        provenance=provenance,
+    )
+
+    manifest = json.loads((tmp_path / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["provenance"] == {
+        "source_commit": "task-3-test",
+        "execution_backend": "kaggle",
+        "generation_law_version": "standard_monolithic_v1",
+        "checkpoint_identity": "pilot-checkpoint:test",
+        "generation_mode": "standard",
+        "generation_chunk_rounds": None,
+    }
+    assert "root_seed" not in json.dumps(manifest)
+
+
+def test_bounded_generation_exports_only_after_a_verified_pair(tmp_path: Path) -> None:
+    spec = _tiny_pilot_spec()
+    options, provenance = _kaggle_execution()
+    output_root = tmp_path / "run"
+    checkpoint_root = tmp_path / "checkpoint"
+
+    manifest = generate_bounded_checkpoint(
+        spec,
+        expand_jobs(spec, include_sealed=False)[:1],
+        output_root,
+        checkpoint_root,
+        workers=1,
+        execution_options=options,
+        provenance=provenance,
+    )
+
+    assert manifest.generated == 1
+    assert (checkpoint_root / "run_manifest.json").read_bytes() == (
+        output_root / "run_manifest.json"
+    ).read_bytes()
+    assert len(tuple(checkpoint_root.glob("data/observable/*/*/*"))) == 1
+    assert len(tuple(checkpoint_root.glob("data/labels/*/*/*"))) == 1
+
+
+def test_kaggle_resume_rejects_private_seed_manifest_before_generation(tmp_path: Path) -> None:
+    spec = _tiny_pilot_spec()
+    options, provenance = _kaggle_execution()
+    manifest = _manifest_payload({}, spec, provenance=provenance)
+    manifest["sealed_manifest"] = {"root_seed": 99887766}
+    manifest_path = tmp_path / "run_manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="private seed"):
+        generate_matrix(
+            spec,
+            expand_jobs(spec, include_sealed=False)[:1],
+            tmp_path,
+            workers=1,
+            execution_options=options,
+            provenance=provenance,
+        )
+    assert not (tmp_path / "data").exists()
+
+
+def test_kaggle_generation_rejects_invalid_sealed_commitment_before_worker(
+    tmp_path: Path,
+) -> None:
+    spec = _tiny_pilot_spec()
+    options, provenance = _kaggle_execution()
+    commitment = tmp_path / "data" / "manifests" / "sealed_commitment.json"
+    commitment.parent.mkdir(parents=True)
+    commitment.write_text(json.dumps({"algorithm": "sha256", "digest": "z" * 64}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid sealed commitment"):
+        generate_matrix(
+            spec,
+            expand_jobs(spec, include_sealed=False)[:1],
+            tmp_path,
+            workers=1,
+            execution_options=options,
+            provenance=provenance,
+        )
+    assert not (tmp_path / "data" / "observable").exists()
 
 
 def test_failed_trajectory_remains_in_manifest(tiny_spec, tmp_path: Path) -> None:

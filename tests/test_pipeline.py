@@ -196,6 +196,105 @@ def test_eda_cli_rejects_a_production_profile_and_incomplete_pilot(
         )
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["generate-pilot", "--execution-backend", "local", "--job-limit", "1"],
+        ["generate-pilot", "--execution-backend", "kaggle"],
+        [
+            "generate-pilot",
+            "--execution-backend",
+            "kaggle",
+            "--job-limit",
+            "1",
+            "--checkpoint-root",
+            "checkpoint",
+            "--workers",
+            "2",
+        ],
+        [
+            "generate",
+            "--execution-backend",
+            "kaggle",
+            "--job-limit",
+            "1",
+            "--checkpoint-root",
+            "checkpoint",
+        ],
+    ],
+)
+def test_invalid_kaggle_cli_combinations_fail_before_output(
+    arguments: list[str], tmp_path: Path
+) -> None:
+    output_root = tmp_path / "output"
+    with pytest.raises(ValueError):
+        main(
+            [
+                *arguments,
+                "--config",
+                "configs/poc_pilot.json",
+                "--output-root",
+                str(output_root),
+                "--dry-run",
+            ]
+        )
+    assert not output_root.exists()
+
+
+def test_kaggle_pilot_dry_run_accepts_explicit_bounded_checkpoint_flags(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert (
+        main(
+            [
+                "generate-pilot",
+                "--config",
+                "configs/poc_pilot.json",
+                "--output-root",
+                str(tmp_path / "run"),
+                "--execution-backend",
+                "kaggle",
+                "--job-limit",
+                "1",
+                "--checkpoint-root",
+                str(tmp_path / "checkpoint"),
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    status = json.loads(capsys.readouterr().out)
+    assert status["execution_backend"] == "kaggle"
+    assert status["job_limit"] == 1
+    assert status["checkpoint_root"] == str((tmp_path / "checkpoint").resolve())
+    assert not (tmp_path / "run").exists()
+    assert not (tmp_path / "checkpoint").exists()
+
+
+def test_kaggle_cli_rejects_checkpoint_overlap_with_private_manifest(tmp_path: Path) -> None:
+    private = tmp_path / "checkpoint" / "sealed.json"
+    with pytest.raises(ValueError, match="private sealed manifest"):
+        main(
+            [
+                "generate-pilot",
+                "--config",
+                "configs/poc_pilot.json",
+                "--output-root",
+                str(tmp_path / "run"),
+                "--execution-backend",
+                "kaggle",
+                "--job-limit",
+                "1",
+                "--checkpoint-root",
+                str(tmp_path / "checkpoint"),
+                "--sealed-manifest",
+                str(private),
+                "--dry-run",
+            ]
+        )
+    assert not (tmp_path / "run").exists()
+
+
 def test_notebook_is_presentation_only() -> None:
     notebook = json.loads(Path("notebooks/eda.ipynb").read_text(encoding="utf-8"))
     code_cells = [cell for cell in notebook["cells"] if cell["cell_type"] == "code"]

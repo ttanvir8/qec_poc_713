@@ -4,7 +4,7 @@ import concurrent.futures
 import hashlib
 import importlib.metadata
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from hashlib import sha256
@@ -18,6 +18,7 @@ from scipy.special import expit  # type: ignore[import-untyped]
 from causaldem_qec.artifacts import (
     ArtifactConflict,
     canonical_digest,
+    export_checkpoint,
     publish_trajectory,
     verify_trajectory_pair,
     write_manifest,
@@ -27,17 +28,23 @@ from causaldem_qec.core import (
     CanonicalClass,
     CanonicalDemTruth,
     CircuitSpec,
+    ExecutionOptions,
     FailureCode,
     GenerationRequest,
     LabelTrajectory,
+    ManifestProvenance,
     ObservableTrajectory,
     PocSpec,
     RunManifest,
     TrajectoryJob,
     TrajectoryResult,
     derive_seed,
+    deserialize_manifest_provenance,
     expand_jobs,
+    serialize_manifest_provenance,
 )
+
+STANDARD_GENERATION_LAW_VERSION = "standard_monolithic_v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1554,6 +1561,9 @@ def generate_job(request: GenerationRequest) -> TrajectoryResult:
 def _manifest_payload(
     results: Mapping[tuple[str, int], TrajectoryResult],
     spec: PocSpec,
+    *,
+    provenance: ManifestProvenance | None = None,
+    sealed_commitment: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     ordered = [results[key] for key in sorted(results)]
     payload: dict[str, object] = {
@@ -1592,6 +1602,10 @@ def _manifest_payload(
                 "expected_job_keys": _pilot_expected_job_keys(spec),
             }
         )
+    if provenance is not None:
+        payload["provenance"] = serialize_manifest_provenance(provenance)
+    if sealed_commitment is not None:
+        payload["sealed_commitment"] = dict(sealed_commitment)
     return payload
 
 
@@ -1606,7 +1620,9 @@ def _pilot_expected_job_keys(spec: PocSpec) -> list[list[str | int]]:
 
 
 def _run_manifest(
-    results: Mapping[tuple[str, int], TrajectoryResult], manifest_hash: str
+    results: Mapping[tuple[str, int], TrajectoryResult],
+    manifest_hash: str,
+    provenance: ManifestProvenance | None = None,
 ) -> RunManifest:
     ordered = [results[key] for key in sorted(results)]
     hashes = {
@@ -1622,7 +1638,98 @@ def _run_manifest(
         trajectory_hashes=MappingProxyType(hashes),
         failures=failures,
         manifest_hash=manifest_hash,
+        provenance=provenance,
     )
+
+
+def _reject_private_seed_values(value: object) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            normalized = str(key).lower().replace("-", "_")
+            if ("seed" in normalized and "commitment" not in normalized) or normalized == (
+                "sealed_manifest"
+            ):
+                raise ArtifactConflict("run manifest contains private seed data")
+            _reject_private_seed_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_private_seed_values(item)
+
+
+def _manifest_sealed_commitment(
+    spec: PocSpec, root: Path, provenance: ManifestProvenance | None
+) -> Mapping[str, str] | None:
+    if provenance is None:
+        return None
+    relative = spec.raw.get("sealed_commitment_path")
+    if not isinstance(relative, str):
+        raise ArtifactConflict("invalid sealed commitment path")
+    path = root / relative
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ArtifactConflict("invalid sealed commitment") from error
+    digest = value.get("digest") if isinstance(value, Mapping) else None
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"algorithm", "digest"}
+        or value.get("algorithm") != "sha256"
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ArtifactConflict("invalid sealed commitment")
+    return MappingProxyType({"algorithm": "sha256", "digest": digest})
+
+
+def select_incomplete_jobs(
+    jobs: Sequence[TrajectoryJob],
+    *,
+    completed_job_keys: Collection[tuple[str, int]],
+    job_limit: int | None,
+) -> tuple[TrajectoryJob, ...]:
+    """Select a stable bounded prefix without making scheduling order observable."""
+    if job_limit is not None and job_limit < 1:
+        raise ValueError("job limit must be positive")
+    incomplete = tuple(
+        job
+        for job in sorted(jobs, key=lambda item: (item.condition_id, item.trajectory_id))
+        if (job.condition_id, job.trajectory_id) not in completed_job_keys
+    )
+    return incomplete if job_limit is None else incomplete[:job_limit]
+
+
+def _validate_execution_identity(
+    spec: PocSpec,
+    workers: int,
+    execution_options: ExecutionOptions,
+    provenance: ManifestProvenance | None,
+) -> None:
+    if execution_options.execution_backend == "local":
+        if execution_options.job_limit is not None or execution_options.checkpoint_identity:
+            raise ValueError("bounded execution options require the kaggle backend")
+        if provenance is not None:
+            raise ValueError("local generation does not accept kaggle provenance")
+        return
+    if spec.dataset_profile != "pilot":
+        raise ValueError("kaggle generation requires the pilot dataset profile")
+    if workers != 1:
+        raise ValueError("kaggle generation requires exactly one worker")
+    if execution_options.job_limit is None or execution_options.checkpoint_identity is None:
+        raise ValueError("kaggle generation requires a job limit and checkpoint identity")
+    if execution_options.generation_mode != "standard":
+        raise ValueError("bounded scientific generation is not implemented")
+    if (
+        provenance is None
+        or provenance.execution_backend != execution_options.execution_backend
+        or provenance.checkpoint_identity != execution_options.checkpoint_identity
+        or provenance.generation_mode != execution_options.generation_mode
+        or provenance.generation_chunk_rounds != execution_options.generation_chunk_rounds
+        or provenance.generation_law_version != STANDARD_GENERATION_LAW_VERSION
+    ):
+        raise ValueError("kaggle execution provenance mismatch")
 
 
 def _previous_failures(
@@ -1700,7 +1807,9 @@ def _previous_completed(
     return MappingProxyType(completed)
 
 
-def assert_run_manifest_identity(root: Path, spec: PocSpec) -> None:
+def assert_run_manifest_identity(
+    root: Path, spec: PocSpec, provenance: ManifestProvenance | None = None
+) -> None:
     """Reject a root already committed to another profile or resolved configuration."""
     manifest_path = root / "run_manifest.json"
     if not manifest_path.exists():
@@ -1711,6 +1820,7 @@ def assert_run_manifest_identity(root: Path, spec: PocSpec) -> None:
         raise ArtifactConflict("invalid existing run manifest") from error
     if not isinstance(document, Mapping):
         raise ArtifactConflict("invalid existing run manifest")
+    _reject_private_seed_values(document)
     if document.get("dataset_profile", "production") != spec.dataset_profile or document.get(
         "resolved_config_hash"
     ) != _resolved_config_hash(spec):
@@ -1725,21 +1835,41 @@ def assert_run_manifest_identity(root: Path, spec: PocSpec) -> None:
             "expected_job_keys"
         ) != _pilot_expected_job_keys(spec):
             raise ArtifactConflict("pilot manifest geometry or expected job keys mismatch")
+    encoded_provenance = document.get("provenance")
+    if provenance is None:
+        if encoded_provenance is not None:
+            raise ArtifactConflict("run manifest execution identity mismatch")
+    else:
+        try:
+            existing_provenance = deserialize_manifest_provenance(encoded_provenance)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ArtifactConflict("run manifest execution identity mismatch") from error
+        if existing_provenance != provenance:
+            raise ArtifactConflict("run manifest execution identity mismatch")
 
 
 def generate_matrix(
-    spec: PocSpec, jobs: Sequence[TrajectoryJob], root: Path, *, workers: int
+    spec: PocSpec,
+    jobs: Sequence[TrajectoryJob],
+    root: Path,
+    *,
+    workers: int,
+    execution_options: ExecutionOptions | None = None,
+    provenance: ManifestProvenance | None = None,
 ) -> RunManifest:
     """Generate a sorted matrix with parent-owned atomic manifest replacement."""
     if workers < 1:
         raise ValueError("workers must be positive")
-    assert_run_manifest_identity(root, spec)
+    options = execution_options or ExecutionOptions()
+    _validate_execution_identity(spec, workers, options, provenance)
+    assert_run_manifest_identity(root, spec, provenance)
     manifest_path = root / "run_manifest.json"
     config_hash = _resolved_config_hash(spec)
+    sealed_commitment = _manifest_sealed_commitment(spec, root, provenance)
     previous = _previous_failures(manifest_path, config_hash)
     previous_completed = _previous_completed(manifest_path, config_hash)
     results: dict[tuple[str, int], TrajectoryResult] = {}
-    requests: list[GenerationRequest] = []
+    request_jobs: list[TrajectoryJob] = []
     resumed = 0
     for job in sorted(jobs, key=lambda item: (item.condition_id, item.trajectory_id)):
         try:
@@ -1766,7 +1896,15 @@ def generate_matrix(
                 (job.condition_id, job.trajectory_id)
             ]
         else:
-            requests.append(GenerationRequest(spec, job, root))
+            request_jobs.append(job)
+    requests = [
+        GenerationRequest(spec, job, root)
+        for job in select_incomplete_jobs(
+            request_jobs,
+            completed_job_keys=(),
+            job_limit=options.job_limit,
+        )
+    ]
     generated = 0
     if workers == 1:
         iterator = (generate_job(request) for request in requests)
@@ -1774,7 +1912,15 @@ def generate_matrix(
             results[result.job_key] = result
             if result.completed:
                 generated += 1
-            write_manifest(manifest_path, _manifest_payload(results, spec))
+            write_manifest(
+                manifest_path,
+                _manifest_payload(
+                    results,
+                    spec,
+                    provenance=provenance,
+                    sealed_commitment=sealed_commitment,
+                ),
+            )
     elif requests:
         with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(generate_job, request) for request in requests]
@@ -1783,10 +1929,55 @@ def generate_matrix(
                 results[result.job_key] = result
                 if result.completed:
                     generated += 1
-                write_manifest(manifest_path, _manifest_payload(results, spec))
-    manifest_hash = write_manifest(manifest_path, _manifest_payload(results, spec))
-    base = _run_manifest(results, manifest_hash)
+                write_manifest(
+                    manifest_path,
+                    _manifest_payload(
+                        results,
+                        spec,
+                        provenance=provenance,
+                        sealed_commitment=sealed_commitment,
+                    ),
+                )
+    manifest_hash = write_manifest(
+        manifest_path,
+        _manifest_payload(
+            results,
+            spec,
+            provenance=provenance,
+            sealed_commitment=sealed_commitment,
+        ),
+    )
+    base = _run_manifest(results, manifest_hash, provenance)
     return replace(base, generated=generated, resumed=resumed)
+
+
+def generate_bounded_checkpoint(
+    spec: PocSpec,
+    jobs: Sequence[TrajectoryJob],
+    root: Path,
+    checkpoint_root: Path,
+    *,
+    workers: int,
+    execution_options: ExecutionOptions,
+    provenance: ManifestProvenance,
+) -> RunManifest:
+    """Generate a bounded verified prefix and export only after a new complete pair."""
+    manifest = generate_matrix(
+        spec,
+        jobs,
+        root,
+        workers=workers,
+        execution_options=execution_options,
+        provenance=provenance,
+    )
+    if manifest.generated:
+        export_checkpoint(
+            root,
+            checkpoint_root,
+            expected_config_hash=_resolved_config_hash(spec),
+            expected_provenance=provenance,
+        )
+    return manifest
 
 
 def verify_dataset(
