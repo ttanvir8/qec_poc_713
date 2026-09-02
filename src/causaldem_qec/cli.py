@@ -11,7 +11,13 @@ from pathlib import Path
 
 from causaldem_qec.artifacts import load_sealed_seed, write_sealed_commitment
 from causaldem_qec.core import PocSpec, TrajectoryJob, expand_jobs, load_spec
-from causaldem_qec.simulate import assert_run_manifest_identity, generate_matrix, verify_dataset
+from causaldem_qec.report import build_dataset_eda
+from causaldem_qec.simulate import (
+    GateStatus,
+    assert_run_manifest_identity,
+    generate_matrix,
+    verify_dataset,
+)
 
 _PILOT_RESERVE_GIB = 80
 
@@ -23,13 +29,22 @@ class StoragePreflightError(ValueError):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="causaldem-poc")
     parser.add_argument(
-        "stage", choices=("freeze-sealed", "smoke", "generate", "generate-pilot", "verify-dataset")
+        "stage",
+        choices=(
+            "freeze-sealed",
+            "smoke",
+            "generate",
+            "generate-pilot",
+            "verify-dataset",
+            "eda-dataset",
+        ),
     )
     parser.add_argument("--config", type=Path, default=Path("configs/poc.json"))
     parser.add_argument("--output-root", type=Path, default=Path("."))
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--sealed-manifest", type=Path)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--reports-root", type=Path, default=Path("reports/dataset_eda"))
     return parser
 
 
@@ -227,6 +242,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
         )
+        return 0
+    if args.stage == "eda-dataset":
+        _require_pilot_config(args.config, spec)
+        try:
+            assert_run_manifest_identity(args.output_root, spec)
+        except ValueError as error:
+            raise ValueError(
+                "eda-dataset requires a complete pilot root with verified artifacts"
+            ) from error
+        gates = verify_dataset(spec, expand_jobs(spec, include_sealed=True), args.output_root)
+        if any(item.status is not GateStatus.PASS for item in gates if item.gate_id != "DQ08"):
+            raise ValueError("eda-dataset requires a complete pilot root with verified artifacts")
+        index = build_dataset_eda(
+            args.output_root,
+            args.reports_root,
+            sample_seed=spec.public_root_seed,
+            chunk_rounds=spec.chunk_rounds,
+        )
+        print(json.dumps({"scientific_status": "PILOT / NOT FINAL", "sections": index.sections}))
         return 0
     verified_spec, jobs = _existing_jobs(spec, args.output_root)
     gates = verify_dataset(verified_spec, jobs, args.output_root)
