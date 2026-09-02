@@ -6,8 +6,15 @@ import pytest
 
 from causaldem_qec.artifacts import publish_trajectory
 from causaldem_qec.cli import main
-from causaldem_qec.core import LabelTrajectory, ObservableTrajectory, TrajectoryJob, load_spec
+from causaldem_qec.core import (
+    LabelTrajectory,
+    ManifestProvenance,
+    ObservableTrajectory,
+    TrajectoryJob,
+    load_spec,
+)
 from causaldem_qec.report import DATASET_EDA_SECTIONS, build_dataset_eda, validate_inventory
+from causaldem_qec.simulate import _manifest_payload, assert_run_manifest_identity
 
 
 def _observable(start: int, rounds: int = 128) -> ObservableTrajectory:
@@ -193,6 +200,47 @@ def test_eda_cli_rejects_a_production_profile_and_incomplete_pilot(
                 "--reports-root",
                 str(tmp_path / "reports"),
             ]
+        )
+
+
+def test_eda_identity_preflight_accepts_a_valid_provenance_bound_kaggle_manifest(
+    tmp_path: Path,
+) -> None:
+    spec = load_spec(Path("configs/poc_pilot.json"))
+    provenance = ManifestProvenance(
+        source_commit="task-3-review",
+        execution_backend="kaggle",
+        generation_law_version="standard_monolithic_v1",
+        checkpoint_identity="pilot-checkpoint:review",
+    )
+    (tmp_path / "run_manifest.json").write_text(
+        json.dumps(_manifest_payload({}, spec, provenance=provenance)), encoding="utf-8"
+    )
+
+    assert_run_manifest_identity(
+        tmp_path,
+        spec,
+        allow_bound_provenance=True,
+    )
+
+
+def test_eda_identity_preflight_rejects_non_kaggle_bound_provenance(tmp_path: Path) -> None:
+    spec = load_spec(Path("configs/poc_pilot.json"))
+    provenance = ManifestProvenance(
+        source_commit="task-3-review",
+        execution_backend="local",
+        generation_law_version="standard_monolithic_v1",
+        checkpoint_identity=None,
+    )
+    (tmp_path / "run_manifest.json").write_text(
+        json.dumps(_manifest_payload({}, spec, provenance=provenance)), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="execution identity"):
+        assert_run_manifest_identity(
+            tmp_path,
+            spec,
+            allow_bound_provenance=True,
         )
 
 

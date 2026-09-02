@@ -554,6 +554,49 @@ def test_bounded_generation_is_deterministic_across_clean_and_resumed_runs(
     assert second.trajectory_hashes == clean.trajectory_hashes
 
 
+def test_nonsealed_bounded_resume_preserves_verified_sealed_manifest_entry(
+    tmp_path: Path,
+) -> None:
+    spec = _tiny_pilot_spec()
+    options, provenance = _kaggle_execution()
+    all_jobs = expand_jobs(spec, include_sealed=True)
+    sealed_job = next(job for job in all_jobs if job.split == "sealed_test")
+    nonsealed_job = next(job for job in all_jobs if job.split != "sealed_test")
+    commitment = tmp_path / "data" / "manifests" / "sealed_commitment.json"
+    commitment.parent.mkdir(parents=True)
+    commitment.write_text(json.dumps({"algorithm": "sha256", "digest": "c" * 64}), encoding="utf-8")
+
+    sealed = generate_matrix(
+        spec,
+        (sealed_job,),
+        tmp_path,
+        workers=1,
+        execution_options=options,
+        provenance=provenance,
+    )
+    resumed = generate_matrix(
+        spec,
+        (nonsealed_job,),
+        tmp_path,
+        workers=1,
+        execution_options=options,
+        provenance=provenance,
+    )
+
+    document = json.loads((tmp_path / "run_manifest.json").read_text(encoding="utf-8"))
+    completed_keys = {
+        (item["condition_id"], item["trajectory_id"])
+        for item in document["results"]
+        if item["completed"] is True
+    }
+    assert sealed.completed == 1
+    assert resumed.completed == 2
+    assert completed_keys == {
+        (sealed_job.condition_id, sealed_job.trajectory_id),
+        (nonsealed_job.condition_id, nonsealed_job.trajectory_id),
+    }
+
+
 def test_kaggle_manifest_binds_execution_identity_without_raw_seed(
     tmp_path: Path,
 ) -> None:

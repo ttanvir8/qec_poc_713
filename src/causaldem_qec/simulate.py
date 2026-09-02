@@ -1807,8 +1807,40 @@ def _previous_completed(
     return MappingProxyType(completed)
 
 
+def _restore_previous_results(
+    spec: PocSpec,
+    root: Path,
+    resolved_config_hash: str,
+    previous_failures: Mapping[tuple[str, int], TrajectoryResult],
+    previous_completed: Mapping[tuple[str, int], tuple[str, str, str] | None],
+) -> dict[tuple[str, int], TrajectoryResult]:
+    expected_jobs = {
+        (job.condition_id, job.trajectory_id): job for job in expand_jobs(spec, include_sealed=True)
+    }
+    unknown = (set(previous_failures) | set(previous_completed)) - set(expected_jobs)
+    if unknown:
+        raise ArtifactConflict("run manifest contains an unexpected job")
+    results = dict(previous_failures)
+    for key, manifest_hashes in previous_completed.items():
+        job = expected_jobs[key]
+        hashes = verify_trajectory_pair(root, job, resolved_config_hash=resolved_config_hash)
+        if hashes is None or manifest_hashes != hashes:
+            results[key] = TrajectoryResult.failed(
+                job,
+                FailureCode.ARTIFACT_CONFLICT,
+                "manifest pair identity mismatch",
+            )
+            continue
+        results[key] = TrajectoryResult.complete(job, *hashes)
+    return results
+
+
 def assert_run_manifest_identity(
-    root: Path, spec: PocSpec, provenance: ManifestProvenance | None = None
+    root: Path,
+    spec: PocSpec,
+    provenance: ManifestProvenance | None = None,
+    *,
+    allow_bound_provenance: bool = False,
 ) -> None:
     """Reject a root already committed to another profile or resolved configuration."""
     manifest_path = root / "run_manifest.json"
@@ -1838,7 +1870,19 @@ def assert_run_manifest_identity(
     encoded_provenance = document.get("provenance")
     if provenance is None:
         if encoded_provenance is not None:
-            raise ArtifactConflict("run manifest execution identity mismatch")
+            try:
+                bound_provenance = deserialize_manifest_provenance(encoded_provenance)
+            except (KeyError, TypeError, ValueError) as error:
+                raise ArtifactConflict("run manifest execution identity mismatch") from error
+            if (
+                not allow_bound_provenance
+                or bound_provenance.execution_backend != "kaggle"
+                or bound_provenance.checkpoint_identity is None
+                or bound_provenance.generation_law_version != STANDARD_GENERATION_LAW_VERSION
+                or bound_provenance.generation_mode != "standard"
+                or bound_provenance.generation_chunk_rounds is not None
+            ):
+                raise ArtifactConflict("run manifest execution identity mismatch")
     else:
         try:
             existing_provenance = deserialize_manifest_provenance(encoded_provenance)
@@ -1868,10 +1912,21 @@ def generate_matrix(
     sealed_commitment = _manifest_sealed_commitment(spec, root, provenance)
     previous = _previous_failures(manifest_path, config_hash)
     previous_completed = _previous_completed(manifest_path, config_hash)
-    results: dict[tuple[str, int], TrajectoryResult] = {}
+    results = _restore_previous_results(
+        spec,
+        root,
+        config_hash,
+        previous,
+        previous_completed,
+    )
     request_jobs: list[TrajectoryJob] = []
     resumed = 0
     for job in sorted(jobs, key=lambda item: (item.condition_id, item.trajectory_id)):
+        existing = results.get((job.condition_id, job.trajectory_id))
+        if existing is not None:
+            if existing.completed:
+                resumed += 1
+            continue
         try:
             hashes = verify_trajectory_pair(root, job, resolved_config_hash=config_hash)
         except ArtifactConflict as error:
@@ -1880,21 +1935,8 @@ def generate_matrix(
             )
             continue
         if hashes is not None:
-            prior_hashes = previous_completed.get((job.condition_id, job.trajectory_id))
-            if (
-                job.condition_id,
-                job.trajectory_id,
-            ) in previous_completed and prior_hashes != hashes:
-                results[(job.condition_id, job.trajectory_id)] = TrajectoryResult.failed(
-                    job, FailureCode.ARTIFACT_CONFLICT, "manifest pair identity mismatch"
-                )
-                continue
             results[(job.condition_id, job.trajectory_id)] = TrajectoryResult.complete(job, *hashes)
             resumed += 1
-        elif (job.condition_id, job.trajectory_id) in previous:
-            results[(job.condition_id, job.trajectory_id)] = previous[
-                (job.condition_id, job.trajectory_id)
-            ]
         else:
             request_jobs.append(job)
     requests = [

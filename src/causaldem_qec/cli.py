@@ -367,7 +367,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.stage == "eda-dataset":
         _require_pilot_config(args.config, spec)
         try:
-            assert_run_manifest_identity(args.output_root, spec)
+            assert_run_manifest_identity(
+                args.output_root,
+                spec,
+                allow_bound_provenance=True,
+            )
         except ValueError as error:
             raise ValueError(
                 "eda-dataset requires a complete pilot root with verified artifacts"
