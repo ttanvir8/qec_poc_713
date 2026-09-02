@@ -119,6 +119,7 @@ class CanonicalClass:
 @dataclass(frozen=True, slots=True)
 class CanonicalCatalog:
     classes: tuple[CanonicalClass, ...]
+    duplicate_sizes: tuple[int, ...]
     graphlike_mass: float
     adaptable_mass: float
     ambiguous_logical_mass: float

@@ -513,6 +513,15 @@ def test_manifest_binds_common_pair_id_to_completed_lane_hashes(tiny_spec, tmp_p
         ).read_text(encoding="utf-8")
     )
     assert result["pair_id"] == observable["pair_id"] == labels["pair_id"]
+    summary = labels["metadata"]["canonical_catalog"]
+    assert summary["class_count"] > 0
+    assert len(summary["duplicate_sizes"]) == summary["class_count"]
+    assert set(summary) >= {
+        "graphlike_mass",
+        "adaptable_mass",
+        "ambiguous_logical_mass",
+        "hyperedge_mass",
+    }
     assert result["observable_hash"]
     assert result["label_hash"]
 

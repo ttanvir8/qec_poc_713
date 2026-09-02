@@ -283,6 +283,7 @@ def _catalog_from_events(
     )
     return CanonicalCatalog(
         classes=tuple(classes),
+        duplicate_sizes=tuple(len(groups[item.detector_signature]) for item in classes),
         graphlike_mass=graphlike_mass,
         adaptable_mass=adaptable_mass,
         ambiguous_logical_mass=ambiguous_mass,
@@ -1481,7 +1482,22 @@ def assemble_artifacts(
         "circuit_hash": hashlib.sha256(str(sampled.circuit).encode("utf-8")).hexdigest(),
         "undecomposed_dem_hash": truth.dem_hash,
         "canonical_catalog_hash": truth.catalog.catalog_hash,
+        "canonical_catalog": {
+            "class_count": len(truth.catalog.classes),
+            "duplicate_sizes": truth.catalog.duplicate_sizes,
+            "graphlike_mass": truth.catalog.graphlike_mass,
+            "adaptable_mass": truth.catalog.adaptable_mass,
+            "ambiguous_logical_mass": truth.catalog.ambiguous_logical_mass,
+            "hyperedge_mass": truth.catalog.hyperedge_mass,
+        },
         "dynamics_hash": canonical_digest(path.generator_metadata),
+        "generation_law": {
+            "dynamics_id": job.dynamics_id,
+            "component_bounds": path.generator_metadata["component_bounds"],
+            "missingness_parameters": dict(path.missingness_parameters),
+            "observation_flip_probability": path.observation_flip_probability,
+            "contamination_is_post_sampling": path.contamination_is_post_sampling,
+        },
         "resolved_config_hash": config_hash,
         "package_versions": _package_versions(),
         "public_seed_commitment": canonical_digest({"public_root_seed": job.root_seed}),
