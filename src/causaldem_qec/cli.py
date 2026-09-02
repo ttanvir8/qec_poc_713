@@ -142,6 +142,22 @@ def _pilot_status(
     dry_run: bool,
     manifest: str | None,
 ) -> dict[str, object]:
+    allocation: dict[str, list[dict[str, str | int]]] = {
+        partition: [] for partition in ("normal", "development", "sealed")
+    }
+    partition_by_condition = {
+        condition_id: partition
+        for partition, condition_ids in spec.pilot_partitions.items()
+        for condition_id in condition_ids
+    }
+    for job in expand_jobs(spec, include_sealed=True):
+        allocation[partition_by_condition[job.condition_id]].append(
+            {
+                "condition_id": job.condition_id,
+                "trajectory_id": job.trajectory_id,
+                "split": job.split,
+            }
+        )
     return {
         "dataset_profile": spec.dataset_profile,
         "scientific_status": "PILOT_NOT_FINAL",
@@ -152,6 +168,7 @@ def _pilot_status(
         ),
         "sealed_access": "validated" if len(jobs) == 88 else "requires_private_manifest",
         "scheduled_jobs": len(jobs),
+        "allocation": allocation,
         "required_storage_gib": _PILOT_RESERVE_GIB,
         "available_storage_bytes": free_bytes,
         "dry_run": dry_run,

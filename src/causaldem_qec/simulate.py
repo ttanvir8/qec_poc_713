@@ -1573,16 +1573,20 @@ def _manifest_payload(
         payload.update(
             {
                 "dataset_profile": spec.dataset_profile,
-                "expected_job_keys": [
-                    [job.condition_id, job.trajectory_id]
-                    for job in sorted(
-                        expand_jobs(spec, include_sealed=True),
-                        key=lambda item: (item.condition_id, item.trajectory_id),
-                    )
-                ],
+                "expected_job_keys": _pilot_expected_job_keys(spec),
             }
         )
     return payload
+
+
+def _pilot_expected_job_keys(spec: PocSpec) -> list[list[str | int]]:
+    return [
+        [job.condition_id, job.trajectory_id]
+        for job in sorted(
+            expand_jobs(spec, include_sealed=True),
+            key=lambda item: (item.condition_id, item.trajectory_id),
+        )
+    ]
 
 
 def _run_manifest(
@@ -1695,6 +1699,16 @@ def assert_run_manifest_identity(root: Path, spec: PocSpec) -> None:
         "resolved_config_hash"
     ) != _resolved_config_hash(spec):
         raise ArtifactConflict("run manifest profile or configuration mismatch")
+    if spec.dataset_profile == "pilot":
+        expected_generation = {
+            "trajectories_per_condition": spec.trajectories_per_condition,
+            "burn_in_rounds": spec.burn_in_rounds,
+            "scored_rounds": spec.scored_rounds,
+        }
+        if document.get("generation") != expected_generation or document.get(
+            "expected_job_keys"
+        ) != _pilot_expected_job_keys(spec):
+            raise ArtifactConflict("pilot manifest geometry or expected job keys mismatch")
 
 
 def generate_matrix(

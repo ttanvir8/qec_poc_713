@@ -564,6 +564,15 @@ def test_generate_pilot_dry_run_reports_profile_matrix_and_reserve(
     assert status["nonsealed_jobs"] == 64
     assert status["sealed_jobs"] == 24
     assert status["required_storage_gib"] == 80
+    assert set(status["allocation"]) == {"normal", "development", "sealed"}
+    assert len(status["allocation"]["normal"]) == 40
+    assert len(status["allocation"]["development"]) == 24
+    assert len(status["allocation"]["sealed"]) == 24
+    assert status["allocation"]["normal"][0] == {
+        "condition_id": "repetition_d3__f01",
+        "trajectory_id": 0,
+        "split": "train",
+    }
     assert not (tmp_path / "pilot").exists()
 
 
@@ -586,3 +595,28 @@ def test_profile_mismatched_manifest_is_a_typed_conflict(tmp_path: Path) -> None
     )
     with pytest.raises(ValueError, match="run manifest profile or configuration mismatch"):
         assert_run_manifest_identity(tmp_path, load_spec(Path("configs/poc_pilot.json")))
+
+
+@pytest.mark.parametrize(
+    "field", ["generation", "expected_job_keys", "missing_generation", "missing_expected_job_keys"]
+)
+def test_pilot_manifest_rejects_missing_or_altered_geometry_and_expected_job_keys(
+    tmp_path: Path, field: str
+) -> None:
+    pilot = load_spec(Path("configs/poc_pilot.json"))
+    manifest = _manifest_payload({}, pilot)
+    if field == "generation":
+        manifest["generation"] = {
+            "trajectories_per_condition": 64,
+            "burn_in_rounds": 4096,
+            "scored_rounds": 65536,
+        }
+    elif field == "expected_job_keys":
+        manifest["expected_job_keys"] = manifest["expected_job_keys"][1:]
+    elif field == "missing_generation":
+        del manifest["generation"]
+    else:
+        del manifest["expected_job_keys"]
+    (tmp_path / "run_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="pilot manifest"):
+        assert_run_manifest_identity(tmp_path, pilot)
