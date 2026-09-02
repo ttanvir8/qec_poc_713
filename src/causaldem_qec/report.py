@@ -124,6 +124,15 @@ def _pairs(root: Path, manifest: Mapping[str, object]) -> tuple[_Pair, ...]:
         )
     validate_inventory([(pair.condition_id, pair.trajectory_id) for pair in pairs])
     results = manifest.get("results")
+    result_keys = (
+        [
+            (result.get("condition_id"), result.get("trajectory_id"))
+            for result in results
+            if isinstance(result, Mapping)
+        ]
+        if isinstance(results, list)
+        else []
+    )
     if (
         not isinstance(results, list)
         or any(
@@ -131,6 +140,8 @@ def _pairs(root: Path, manifest: Mapping[str, object]) -> tuple[_Pair, ...]:
             for result in results
         )
         or len(results) != len(pairs)
+        or set(result_keys) != {(pair.condition_id, pair.trajectory_id) for pair in pairs}
+        or len(result_keys) != len(set(result_keys))
     ):
         raise ValueError("pilot EDA requires a complete pilot root")
     if not pairs:
@@ -352,6 +363,7 @@ def build_dataset_eda(
     spectra: list[float] = []
     pacfs: list[float] = []
     acfs: list[float] = []
+    block_class_sums: dict[tuple[str, int], tuple[np.ndarray, int]] = {}
     for pair, values in _iter_verified_chunks(pairs, chunk_rounds):
         detector_count = int(values["detector_count"][0])
         packed = values["detector_bits_packed"]
@@ -364,12 +376,11 @@ def build_dataset_eda(
         class_probability = values["class_probability"][queried]
         # Exact XOR composition, not an OR probability.
         theory = 0.5 * (1.0 - np.prod(1.0 - 2.0 * class_probability, axis=1))
-        block_theory = 0.0
         for block in np.unique(values["block"][queried]):
-            block_probability = class_probability[values["block"][queried] == block].mean(axis=0)
-            block_theory += float(0.5 * (1.0 - np.prod(1.0 - 2.0 * block_probability))) * int(
-                np.count_nonzero(values["block"][queried] == block)
-            )
+            selected = class_probability[values["block"][queried] == block]
+            key = (pair.condition_id, int(block))
+            previous, count = block_class_sums.get(key, (np.zeros(selected.shape[1]), 0))
+            block_class_sums[key] = (previous + selected.sum(axis=0), count + len(selected))
         totals["rounds"] += len(values["global_round"])
         totals["valid"] += int(valid.sum())
         totals["detectors"] += valid.size
@@ -378,7 +389,6 @@ def build_dataset_eda(
         totals["classes"] += float(values["class_probability"].sum())
         totals["parity"] += float(parity.sum())
         totals["theory"] += float(theory.sum())
-        totals["block_theory"] += block_theory
         totals["queried"] += len(parity)
         covariance = np.cov(bits.astype(float), rowvar=False) if len(bits) > 1 else np.zeros((2, 2))
         totals["cov_pos"] += int((covariance > 0).sum())
@@ -402,6 +412,10 @@ def build_dataset_eda(
         if (token % max(len(pairs), 1) == 0 or not sampled) and len(parity):
             sampled.append(parity)
     rounds = max(int(totals["rounds"]), 1)
+    totals["block_theory"] = sum(
+        float(0.5 * (1.0 - np.prod(1.0 - 2.0 * (values / count))) * count)
+        for values, count in block_class_sums.values()
+    )
     rates = {
         "detector_rate": totals["bits"] / max(int(totals["detectors"]), 1),
         "valid_rate": totals["valid"] / max(int(totals["detectors"]), 1),
