@@ -8,11 +8,14 @@ import numpy as np
 import pytest
 import stim
 
+from causaldem_qec.cli import main
 from causaldem_qec.core import CircuitSpec, TrajectoryJob, expand_jobs, load_spec
 from causaldem_qec.simulate import (
     NOISE_KIND,
     AuditContext,
     GateStatus,
+    _manifest_payload,
+    assert_run_manifest_identity,
     bounded_probability,
     canonicalize_dem,
     canonicalize_dem_truth,
@@ -514,15 +517,14 @@ def test_manifest_binds_common_pair_id_to_completed_lane_hashes(tiny_spec, tmp_p
     assert result["label_hash"]
 
 
-def test_config_changed_failure_is_not_resumed_by_job_key(tiny_spec, tmp_path: Path) -> None:
+def test_config_changed_failure_root_is_a_typed_conflict(tiny_spec, tmp_path: Path) -> None:
     jobs = expand_jobs(tiny_spec, include_sealed=False)[:1]
     invalid_bounds = dict(tiny_spec.component_bounds)
     invalid_bounds["repetition_data"] = (0.6, 0.7)
     failed = replace(tiny_spec, component_bounds=invalid_bounds)
     assert generate_matrix(failed, jobs, tmp_path, workers=1).failures
-    recovered = generate_matrix(tiny_spec, jobs, tmp_path, workers=1)
-    assert recovered.generated == 1
-    assert recovered.completed == 1
+    with pytest.raises(ValueError, match="run manifest profile or configuration mismatch"):
+        generate_matrix(tiny_spec, jobs, tmp_path, workers=1)
 
 
 def test_resume_rejects_manifest_pair_id_that_disagrees_with_verified_lanes(
@@ -537,3 +539,50 @@ def test_resume_rejects_manifest_pair_id_that_disagrees_with_verified_lanes(
     resumed = generate_matrix(tiny_spec, jobs, tmp_path, workers=1)
     assert resumed.completed == 0
     assert resumed.failures[0].code.value == "artifact_conflict"
+
+
+def test_generate_pilot_dry_run_reports_profile_matrix_and_reserve(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert (
+        main(
+            [
+                "generate-pilot",
+                "--config",
+                "configs/poc_pilot.json",
+                "--output-root",
+                str(tmp_path / "pilot"),
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    status = json.loads(capsys.readouterr().out)
+    assert status["dataset_profile"] == "pilot"
+    assert status["scientific_status"] == "PILOT_NOT_FINAL"
+    assert status["total_jobs"] == 88
+    assert status["nonsealed_jobs"] == 64
+    assert status["sealed_jobs"] == 24
+    assert status["required_storage_gib"] == 80
+    assert not (tmp_path / "pilot").exists()
+
+
+def test_pilot_manifest_binds_profile_geometry_and_all_expected_job_keys() -> None:
+    pilot = load_spec(Path("configs/poc_pilot.json"))
+    manifest = _manifest_payload({}, pilot)
+    assert manifest["dataset_profile"] == "pilot"
+    assert manifest["generation"] == {
+        "trajectories_per_condition": 64,
+        "burn_in_rounds": 4096,
+        "scored_rounds": 8192,
+    }
+    assert len(manifest["expected_job_keys"]) == 88
+
+
+def test_profile_mismatched_manifest_is_a_typed_conflict(tmp_path: Path) -> None:
+    (tmp_path / "run_manifest.json").write_text(
+        json.dumps({"dataset_profile": "production", "resolved_config_hash": "different"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="run manifest profile or configuration mismatch"):
+        assert_run_manifest_identity(tmp_path, load_spec(Path("configs/poc_pilot.json")))

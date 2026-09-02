@@ -36,6 +36,7 @@ from causaldem_qec.core import (
     TrajectoryJob,
     TrajectoryResult,
     derive_seed,
+    expand_jobs,
 )
 
 
@@ -1384,6 +1385,11 @@ def _future_block_probability(class_probability: np.ndarray, block_rounds: int) 
 
 
 def _resolved_config_hash(spec: PocSpec) -> str:
+    profile_resolution: Mapping[str, object] = (
+        {"dataset_profile": spec.dataset_profile, "pilot_partitions": spec.pilot_partitions}
+        if spec.dataset_profile == "pilot"
+        else {}
+    )
     return canonical_digest(
         {
             "raw": spec.raw,
@@ -1415,6 +1421,7 @@ def _resolved_config_hash(spec: PocSpec) -> str:
                 "retry_attempts": spec.retry_attempts,
                 "chunk_rounds": spec.chunk_rounds,
                 "roots": spec.roots,
+                **profile_resolution,
             },
         }
     )
@@ -1466,30 +1473,31 @@ def assemble_artifacts(
     schema_value = spec.raw["schema_version"]
     if not isinstance(schema_value, int):
         raise InvalidPhysicalPath("invalid schema version")
-    metadata: Mapping[str, object] = MappingProxyType(
-        {
-            "schema_version": schema_value,
-            "condition_id": job.condition_id,
-            "trajectory_id": job.trajectory_id,
-            "split": job.split,
-            "circuit_hash": hashlib.sha256(str(sampled.circuit).encode("utf-8")).hexdigest(),
-            "undecomposed_dem_hash": truth.dem_hash,
-            "canonical_catalog_hash": truth.catalog.catalog_hash,
-            "dynamics_hash": canonical_digest(path.generator_metadata),
-            "resolved_config_hash": config_hash,
-            "package_versions": _package_versions(),
-            "public_seed_commitment": canonical_digest({"public_root_seed": job.root_seed}),
-            "stream_commitments": _stream_commitments(spec, job, attempt),
-            "logical_array_shapes": {
-                "detector_bits": tuple(observable.detector_bits.shape),
-                "logical_observable": tuple(observable.logical_observable.shape),
-                "class_probability": tuple(labels.class_probability.shape),
-            },
-            "episode_rounds": spec.episode_rounds,
-            "block_rounds": spec.block_rounds,
-            "creation_attempt": attempt,
-        }
-    )
+    metadata_values: dict[str, object] = {
+        "schema_version": schema_value,
+        "condition_id": job.condition_id,
+        "trajectory_id": job.trajectory_id,
+        "split": job.split,
+        "circuit_hash": hashlib.sha256(str(sampled.circuit).encode("utf-8")).hexdigest(),
+        "undecomposed_dem_hash": truth.dem_hash,
+        "canonical_catalog_hash": truth.catalog.catalog_hash,
+        "dynamics_hash": canonical_digest(path.generator_metadata),
+        "resolved_config_hash": config_hash,
+        "package_versions": _package_versions(),
+        "public_seed_commitment": canonical_digest({"public_root_seed": job.root_seed}),
+        "stream_commitments": _stream_commitments(spec, job, attempt),
+        "logical_array_shapes": {
+            "detector_bits": tuple(observable.detector_bits.shape),
+            "logical_observable": tuple(observable.logical_observable.shape),
+            "class_probability": tuple(labels.class_probability.shape),
+        },
+        "episode_rounds": spec.episode_rounds,
+        "block_rounds": spec.block_rounds,
+        "creation_attempt": attempt,
+    }
+    if spec.dataset_profile == "pilot":
+        metadata_values["dataset_profile"] = spec.dataset_profile
+    metadata: Mapping[str, object] = MappingProxyType(metadata_values)
     return observable, labels, metadata
 
 
@@ -1528,10 +1536,11 @@ def generate_job(request: GenerationRequest) -> TrajectoryResult:
 
 
 def _manifest_payload(
-    results: Mapping[tuple[str, int], TrajectoryResult], spec: PocSpec
+    results: Mapping[tuple[str, int], TrajectoryResult],
+    spec: PocSpec,
 ) -> dict[str, object]:
     ordered = [results[key] for key in sorted(results)]
-    return {
+    payload: dict[str, object] = {
         "schema_version": 1,
         "resolved_config_hash": _resolved_config_hash(spec),
         "generation": {
@@ -1560,6 +1569,20 @@ def _manifest_payload(
             for result in ordered
         ],
     }
+    if spec.dataset_profile == "pilot":
+        payload.update(
+            {
+                "dataset_profile": spec.dataset_profile,
+                "expected_job_keys": [
+                    [job.condition_id, job.trajectory_id]
+                    for job in sorted(
+                        expand_jobs(spec, include_sealed=True),
+                        key=lambda item: (item.condition_id, item.trajectory_id),
+                    )
+                ],
+            }
+        )
+    return payload
 
 
 def _run_manifest(
@@ -1657,12 +1680,30 @@ def _previous_completed(
     return MappingProxyType(completed)
 
 
+def assert_run_manifest_identity(root: Path, spec: PocSpec) -> None:
+    """Reject a root already committed to another profile or resolved configuration."""
+    manifest_path = root / "run_manifest.json"
+    if not manifest_path.exists():
+        return
+    try:
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ArtifactConflict("invalid existing run manifest") from error
+    if not isinstance(document, Mapping):
+        raise ArtifactConflict("invalid existing run manifest")
+    if document.get("dataset_profile", "production") != spec.dataset_profile or document.get(
+        "resolved_config_hash"
+    ) != _resolved_config_hash(spec):
+        raise ArtifactConflict("run manifest profile or configuration mismatch")
+
+
 def generate_matrix(
     spec: PocSpec, jobs: Sequence[TrajectoryJob], root: Path, *, workers: int
 ) -> RunManifest:
     """Generate a sorted matrix with parent-owned atomic manifest replacement."""
     if workers < 1:
         raise ValueError("workers must be positive")
+    assert_run_manifest_identity(root, spec)
     manifest_path = root / "run_manifest.json"
     config_hash = _resolved_config_hash(spec)
     previous = _previous_failures(manifest_path, config_hash)

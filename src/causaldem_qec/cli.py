@@ -4,22 +4,32 @@ import argparse
 import json
 import os
 import secrets
+import shutil
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
 from causaldem_qec.artifacts import load_sealed_seed, write_sealed_commitment
 from causaldem_qec.core import PocSpec, TrajectoryJob, expand_jobs, load_spec
-from causaldem_qec.simulate import generate_matrix, verify_dataset
+from causaldem_qec.simulate import assert_run_manifest_identity, generate_matrix, verify_dataset
+
+_PILOT_RESERVE_GIB = 80
+
+
+class StoragePreflightError(ValueError):
+    """The pilot root does not have the documented minimum free space."""
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="causaldem-poc")
-    parser.add_argument("stage", choices=("freeze-sealed", "smoke", "generate", "verify-dataset"))
+    parser.add_argument(
+        "stage", choices=("freeze-sealed", "smoke", "generate", "generate-pilot", "verify-dataset")
+    )
     parser.add_argument("--config", type=Path, default=Path("configs/poc.json"))
     parser.add_argument("--output-root", type=Path, default=Path("."))
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--sealed-manifest", type=Path)
+    parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -98,6 +108,57 @@ def _existing_jobs(spec: PocSpec, output_root: Path) -> tuple[PocSpec, tuple[Tra
     )
 
 
+def _pilot_config_path() -> Path:
+    return Path("configs/poc_pilot.json").resolve()
+
+
+def _require_pilot_config(config_path: Path, spec: PocSpec) -> None:
+    if spec.dataset_profile != "pilot" or config_path.resolve() != _pilot_config_path():
+        raise ValueError("generate-pilot requires configs/poc_pilot.json")
+
+
+def _pilot_preflight(output_root: Path, spec: PocSpec) -> int:
+    full_run_root = Path(spec.roots["runs"]).resolve()
+    if output_root.resolve() in {Path.cwd(), full_run_root}:
+        raise ValueError("pilot output root must be distinct from the full-production root")
+    assert_run_manifest_identity(output_root, spec)
+    probe = output_root.resolve()
+    while not probe.exists():
+        probe = probe.parent
+    free = shutil.disk_usage(probe).free
+    reserve = _PILOT_RESERVE_GIB * 1024**3
+    if free < reserve:
+        raise StoragePreflightError(
+            f"pilot storage preflight requires {_PILOT_RESERVE_GIB} GiB free, found {free} bytes"
+        )
+    return free
+
+
+def _pilot_status(
+    spec: PocSpec,
+    jobs: tuple[TrajectoryJob, ...],
+    *,
+    free_bytes: int,
+    dry_run: bool,
+    manifest: str | None,
+) -> dict[str, object]:
+    return {
+        "dataset_profile": spec.dataset_profile,
+        "scientific_status": "PILOT_NOT_FINAL",
+        "total_jobs": len(expand_jobs(spec, include_sealed=True)),
+        "nonsealed_jobs": len(expand_jobs(spec, include_sealed=False)),
+        "sealed_jobs": sum(
+            job.split == "sealed_test" for job in expand_jobs(spec, include_sealed=True)
+        ),
+        "sealed_access": "validated" if len(jobs) == 88 else "requires_private_manifest",
+        "scheduled_jobs": len(jobs),
+        "required_storage_gib": _PILOT_RESERVE_GIB,
+        "available_storage_bytes": free_bytes,
+        "dry_run": dry_run,
+        "manifest_hash": manifest,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     spec = load_spec(args.config)
@@ -121,6 +182,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         manifest = generate_matrix(spec, jobs, args.output_root, workers=args.workers)
         print(manifest.manifest_hash)
+        return 0
+    if args.stage == "generate-pilot":
+        _require_pilot_config(args.config, spec)
+        free_bytes = _pilot_preflight(args.output_root, spec)
+        jobs = (
+            _sealed_jobs(spec, args.sealed_manifest, args.output_root)
+            if args.sealed_manifest is not None
+            else expand_jobs(spec, include_sealed=False)
+        )
+        if args.dry_run:
+            print(
+                json.dumps(
+                    _pilot_status(spec, jobs, free_bytes=free_bytes, dry_run=True, manifest=None)
+                )
+            )
+            return 0
+        manifest = generate_matrix(spec, jobs, args.output_root, workers=args.workers)
+        print(
+            json.dumps(
+                _pilot_status(
+                    spec,
+                    jobs,
+                    free_bytes=free_bytes,
+                    dry_run=False,
+                    manifest=manifest.manifest_hash,
+                )
+            )
+        )
         return 0
     verified_spec, jobs = _existing_jobs(spec, args.output_root)
     gates = verify_dataset(verified_spec, jobs, args.output_root)

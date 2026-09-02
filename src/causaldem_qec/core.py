@@ -13,8 +13,9 @@ from typing import Any, Literal, cast
 import numpy as np
 
 Split = Literal["train", "validation", "id_test", "development", "sealed_test"]
+DatasetProfile = Literal["production", "pilot"]
 
-_TOP_LEVEL_KEYS = frozenset(
+_REQUIRED_TOP_LEVEL_KEYS = frozenset(
     {
         "schema_version",
         "public_root_seed",
@@ -33,6 +34,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "roots",
     }
 )
+_TOP_LEVEL_KEYS = _REQUIRED_TOP_LEVEL_KEYS | frozenset({"dataset_profile", "pilot_partitions"})
 _CIRCUIT_IDS = frozenset({"repetition_d3", "repetition_d5", "surface_d3", "surface_d5"})
 _DYNAMICS_IDS = frozenset(
     {"f01", "f02", "f03", "f06", "f07", "f08", "f12", "f14_positive", "f14_negative"}
@@ -325,6 +327,16 @@ class PocSpec:
     retry_attempts: int
     chunk_rounds: int
     roots: Mapping[str, str]
+    dataset_profile: DatasetProfile
+    pilot_partitions: Mapping[str, tuple[str, ...]]
+
+    @property
+    def condition_ids(self) -> tuple[str, ...]:
+        return tuple(
+            f"{circuit.circuit_id}__{dynamics_id}"
+            for circuit in self.circuits
+            for dynamics_id in self.condition_sets[f"distance_{circuit.distance}"]
+        )
 
     def __reduce__(self) -> tuple[object, tuple[object, ...]]:
         return _rebuild_poc_spec, (
@@ -349,6 +361,8 @@ class PocSpec:
             self.retry_attempts,
             self.chunk_rounds,
             _thaw(self.roots),
+            self.dataset_profile,
+            _thaw(self.pilot_partitions),
         )
 
 
@@ -520,7 +534,20 @@ def _validate_dynamics(dynamics: Mapping[str, object]) -> Mapping[str, Mapping[s
 
 
 def _load_spec_config(config: Mapping[str, object]) -> PocSpec:
-    _exact_keys(config, _TOP_LEVEL_KEYS, "config")
+    extra = sorted(config.keys() - _TOP_LEVEL_KEYS)
+    missing = sorted(_REQUIRED_TOP_LEVEL_KEYS - config.keys())
+    if extra:
+        raise ValueError(f"unknown config keys: {', '.join(extra)}")
+    if missing:
+        raise ValueError(f"missing config keys: {', '.join(missing)}")
+    profile_value = config.get("dataset_profile", "production")
+    if profile_value not in {"production", "pilot"}:
+        raise ValueError("dataset_profile must be production or pilot")
+    dataset_profile: DatasetProfile = profile_value
+    if dataset_profile == "production" and "pilot_partitions" in config:
+        raise ValueError("production config cannot declare pilot_partitions")
+    if dataset_profile == "pilot" and "pilot_partitions" not in config:
+        raise ValueError("pilot config requires pilot_partitions")
 
     if _integer(config["schema_version"], "schema_version") != 1:
         raise ValueError("schema_version must be 1")
@@ -538,8 +565,13 @@ def _load_spec_config(config: Mapping[str, object]) -> PocSpec:
     scored_rounds = _integer(rounds["scored"], "rounds.scored")
     episode_rounds = _integer(rounds["episode"], "rounds.episode")
     block_rounds = _integer(rounds["block"], "rounds.block")
-    if (burn_in_rounds, scored_rounds, episode_rounds, block_rounds) != (4096, 65536, 32, 256):
-        raise ValueError("rounds must match the committed trajectory fidelity")
+    expected_geometry = (
+        (4096, 8192, 32, 256) if dataset_profile == "pilot" else (4096, 65536, 32, 256)
+    )
+    if (burn_in_rounds, scored_rounds, episode_rounds, block_rounds) != expected_geometry:
+        raise ValueError(
+            f"rounds must match the committed trajectory fidelity for {dataset_profile}"
+        )
 
     circuits_config = _mapping(config["circuits"], "circuits")
     _exact_keys(circuits_config, _CIRCUIT_IDS, "circuits")
@@ -589,6 +621,61 @@ def _load_spec_config(config: Mapping[str, object]) -> PocSpec:
         if condition_values != expected:
             raise ValueError(f"condition_sets.{key} is not the committed condition matrix")
         condition_sets[key] = condition_values
+
+    pilot_partitions: Mapping[str, tuple[str, ...]] = MappingProxyType({})
+    if dataset_profile == "pilot":
+        partition_config = _mapping(config["pilot_partitions"], "pilot_partitions")
+        _exact_keys(
+            partition_config,
+            frozenset({"normal", "development", "sealed"}),
+            "pilot_partitions",
+        )
+        partitions = {
+            name: tuple(
+                _string(value, f"pilot_partitions.{name}")
+                for value in _list(partition_config[name], f"pilot_partitions.{name}")
+            )
+            for name in ("normal", "development", "sealed")
+        }
+        expected_partitions = {
+            "normal": {
+                "repetition_d3__f01",
+                "repetition_d3__f02",
+                "repetition_d3__f03",
+                "surface_d3__f01",
+                "surface_d3__f02",
+                "surface_d3__f03",
+                "repetition_d5__f01",
+                "repetition_d5__f03",
+                "surface_d5__f01",
+                "surface_d5__f03",
+            },
+            "development": {
+                "repetition_d3__f06",
+                "repetition_d3__f07",
+                "repetition_d3__f08",
+                "surface_d3__f06",
+                "surface_d3__f07",
+                "surface_d3__f08",
+                "repetition_d5__f06",
+                "surface_d5__f06",
+            },
+            "sealed": {
+                f"{circuit_id}__{dynamics_id}"
+                for circuit_id in _CIRCUIT_IDS
+                for dynamics_id in ("f12", "f14_positive", "f14_negative")
+            },
+        }
+        for name, expected_partition in expected_partitions.items():
+            if (
+                len(partitions[name]) != len(set(partitions[name]))
+                or set(partitions[name]) != expected_partition
+            ):
+                raise ValueError(f"pilot condition partition {name} is incomplete or invalid")
+        declared = set().union(*[set(values) for values in partitions.values()])
+        if len(declared) != sum(len(values) for values in partitions.values()):
+            raise ValueError("pilot condition partitions must be disjoint")
+        pilot_partitions = MappingProxyType(partitions)
 
     bounds_config = _mapping(config["component_bounds"], "component_bounds")
     _exact_keys(bounds_config, _COMPONENT_IDS, "component_bounds")
@@ -698,6 +785,8 @@ def _load_spec_config(config: Mapping[str, object]) -> PocSpec:
         retry_attempts=retry_attempts,
         chunk_rounds=chunk_rounds,
         roots=roots,
+        dataset_profile=dataset_profile,
+        pilot_partitions=pilot_partitions,
     )
 
 
@@ -714,7 +803,32 @@ def _split_for(dynamics_id: str, trajectory_id: int) -> Split:
 
 
 def expand_jobs(spec: PocSpec, *, include_sealed: bool) -> tuple[TrajectoryJob, ...]:
-    jobs: list[TrajectoryJob] = []
+    if spec.dataset_profile == "pilot":
+        splits: Mapping[str, tuple[tuple[int, Split], ...]] = {
+            "normal": ((0, "train"), (1, "train"), (2, "validation"), (3, "id_test")),
+            "development": ((0, "development"), (1, "development"), (2, "development")),
+            "sealed": ((0, "sealed_test"), (1, "sealed_test")),
+        }
+        by_id = {circuit.circuit_id: circuit for circuit in spec.circuits}
+        jobs: list[TrajectoryJob] = []
+        for partition in ("normal", "development", "sealed"):
+            if partition == "sealed" and not include_sealed:
+                continue
+            for condition_id in spec.pilot_partitions[partition]:
+                circuit_id, dynamics_id = condition_id.split("__", maxsplit=1)
+                for trajectory_id, split in splits[partition]:
+                    jobs.append(
+                        TrajectoryJob(
+                            condition_id=condition_id,
+                            trajectory_id=trajectory_id,
+                            split=split,
+                            circuit=by_id[circuit_id],
+                            dynamics_id=dynamics_id,
+                            root_seed=spec.public_root_seed,
+                        )
+                    )
+        return tuple(jobs)
+    production_jobs: list[TrajectoryJob] = []
     for circuit in spec.circuits:
         dynamics_ids = spec.condition_sets[f"distance_{circuit.distance}"]
         for dynamics_id in sorted(dynamics_ids):
@@ -723,7 +837,7 @@ def expand_jobs(spec: PocSpec, *, include_sealed: bool) -> tuple[TrajectoryJob, 
                 continue
             condition_id = f"{circuit.circuit_id}__{dynamics_id}"
             for trajectory_id in range(spec.trajectories_per_condition):
-                jobs.append(
+                production_jobs.append(
                     TrajectoryJob(
                         condition_id=condition_id,
                         trajectory_id=trajectory_id,
@@ -733,7 +847,7 @@ def expand_jobs(spec: PocSpec, *, include_sealed: bool) -> tuple[TrajectoryJob, 
                         root_seed=spec.public_root_seed,
                     )
                 )
-    return tuple(jobs)
+    return tuple(production_jobs)
 
 
 def _thaw(value: object) -> object:
@@ -767,6 +881,8 @@ def _rebuild_poc_spec(*values: object) -> PocSpec:
         retry_attempts=cast(int, values[18]),
         chunk_rounds=cast(int, values[19]),
         roots=cast(Mapping[str, str], _freeze(values[20])),
+        dataset_profile=cast(DatasetProfile, values[21]),
+        pilot_partitions=cast(Mapping[str, tuple[str, ...]], _freeze(values[22])),
     )
 
 

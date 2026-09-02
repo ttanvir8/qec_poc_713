@@ -33,6 +33,7 @@ from causaldem_qec.core import (
 )
 
 CONFIG = Path("configs/poc.json")
+PILOT_CONFIG = Path("configs/poc_pilot.json")
 
 
 def _modified_config(
@@ -56,6 +57,64 @@ def test_config_expands_exact_committed_matrix() -> None:
     assert sum(job.split == "train" for job in jobs) == 320
     assert sum(job.split == "validation" for job in jobs) == 160
     assert sum(job.split == "id_test" for job in jobs) == 160
+
+
+def test_pilot_config_is_an_additive_reduced_profile() -> None:
+    production = load_spec(CONFIG)
+    pilot = load_spec(PILOT_CONFIG)
+    assert production.dataset_profile == "production"
+    assert len(expand_jobs(production, include_sealed=True)) == 1920
+    assert (production.burn_in_rounds, production.scored_rounds) == (4096, 65536)
+    assert pilot.dataset_profile == "pilot"
+    assert (pilot.burn_in_rounds, pilot.scored_rounds) == (4096, 8192)
+
+
+def test_pilot_covers_every_condition_once_in_its_declared_partition() -> None:
+    pilot = load_spec(PILOT_CONFIG)
+    jobs = expand_jobs(pilot, include_sealed=True)
+    assert len(jobs) == 88
+    assert {job.condition_id for job in jobs} == set(pilot.condition_ids)
+    assert sum(job.split == "train" for job in jobs) == 20
+    assert sum(job.split == "validation" for job in jobs) == 10
+    assert sum(job.split == "id_test" for job in jobs) == 10
+    assert sum(job.split == "development" for job in jobs) == 24
+    assert sum(job.split == "sealed_test" for job in jobs) == 24
+    assert len(expand_jobs(pilot, include_sealed=False)) == 64
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("dataset_profile", "not-a-profile", "dataset_profile"),
+        ("rounds", {"burn_in": 4096, "scored": 65536, "episode": 32, "block": 256}, "pilot"),
+    ],
+)
+def test_pilot_profile_rejects_invalid_identity_and_geometry(
+    tmp_path: Path, field: str, value: object, error: str
+) -> None:
+    document = json.loads(PILOT_CONFIG.read_text(encoding="utf-8"))
+    document[field] = value
+    path = tmp_path / "invalid-pilot.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ValueError, match=error):
+        load_spec(path)
+
+
+@pytest.mark.parametrize("partition", ["normal", "development"])
+def test_pilot_profile_rejects_missing_or_duplicate_condition_partition(
+    tmp_path: Path, partition: str
+) -> None:
+    document = json.loads(PILOT_CONFIG.read_text(encoding="utf-8"))
+    if partition == "normal":
+        document["pilot_partitions"]["normal"] = document["pilot_partitions"]["normal"][1:]
+    else:
+        document["pilot_partitions"]["development"].append(
+            document["pilot_partitions"]["normal"][0]
+        )
+    path = tmp_path / "invalid-pilot.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ValueError, match="pilot condition"):
+        load_spec(path)
 
 
 def test_resolved_manifest_has_exact_trajectory_and_round_totals() -> None:
