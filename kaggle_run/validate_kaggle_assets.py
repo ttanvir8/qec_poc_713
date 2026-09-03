@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -37,10 +38,123 @@ def _assert_no_secret_literals(text: str, *, source: str) -> None:
             raise AssertionError(f"{source} contains a forbidden secret or raw-seed literal")
 
 
+def _module_tree(text: str) -> ast.Module:
+    return ast.parse(text, filename=str(RUNNER))
+
+
+def _function_node(tree: ast.Module, name: str) -> ast.FunctionDef:
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{RUNNER.name} missing required function: {name}")
+
+
+def _constant_assign(tree: ast.Module, name: str) -> ast.Assign:
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    return node
+    raise AssertionError(f"{RUNNER.name} missing required constant: {name}")
+
+
+def _load_runner_function(
+    tree: ast.Module,
+    name: str,
+    *,
+    constants: tuple[str, ...] = (),
+) -> Callable[..., object]:
+    namespace: dict[str, object] = {"Path": Path}
+    nodes: list[ast.stmt] = [_constant_assign(tree, constant) for constant in constants]
+    nodes.append(_function_node(tree, name))
+    module = ast.Module(body=nodes, type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, str(RUNNER), "exec"), namespace)  # noqa: S102
+    function = namespace[name]
+    if not callable(function):
+        raise TypeError(f"{RUNNER.name}.{name} is not callable")
+    return function
+
+
+def _assert_default_checkpoint_resolution(tree: ast.Module) -> None:
+    resolver = _load_runner_function(
+        tree,
+        "resolve_checkpoint_input",
+        constants=("DEFAULT_CHECKPOINT_INPUT",),
+    )
+    expected = Path("/kaggle/input/causaldem-pilot-checkpoint-00")
+    for raw in (None, "", "   "):
+        if resolver(raw) != expected:
+            raise AssertionError("empty checkpoint input must resolve to the default Kaggle path")
+    custom = Path("/kaggle/input/custom-checkpoint")
+    if resolver(str(custom)) != custom:
+        raise AssertionError("custom checkpoint input was not preserved")
+
+
+def _assert_no_project_imports_in_notebook_interpreter(tree: ast.Module) -> None:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("causaldem_qec"):
+            raise AssertionError(
+                "project imports must run under uv run python, not the notebook interpreter"
+            )
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("causaldem_qec"):
+                    raise AssertionError(
+                        "project imports must run under uv run python, not the notebook interpreter"
+                    )
+
+
+def _assert_exact_export_allowlist(tree: ast.Module) -> None:
+    allow = _load_runner_function(
+        tree,
+        "is_allowed_checkpoint_payload_path",
+        constants=("DATA_ARTIFACT_FILES", "DATA_ARTIFACT_LANES", "DATA_ARTIFACT_SPLITS"),
+    )
+    allowed = (
+        Path("pilot/run_manifest.json"),
+        Path("pilot/observable/train/repetition_d3__f01/0/arrays.npz"),
+        Path("pilot/labels/sealed_test/surface_d5__f14_negative/63/SHA256SUMS"),
+    )
+    denied = (
+        Path("pilot/source/pyproject.toml"),
+        Path("pilot/observable/train/repetition_d3__f01/0/debug.log"),
+        Path("pilot/observable/train/repetition_d3__f01/staging.tmp/arrays.npz"),
+        Path("dataset-metadata.json"),
+    )
+    for path in allowed:
+        if allow(path) is not True:
+            raise AssertionError(f"checkpoint payload allowlist rejected {path}")
+    for path in denied:
+        if allow(path) is not False:
+            raise AssertionError(f"checkpoint payload allowlist accepted {path}")
+
+
+def _assert_required_runner_structure(runner: str, tree: ast.Module) -> None:
+    _assert_default_checkpoint_resolution(tree)
+    _assert_no_project_imports_in_notebook_interpreter(tree)
+    _assert_exact_export_allowlist(tree)
+    required = (
+        "run_uv_python",
+        "assert_checkpoint_copy_fits",
+        "delete_session_sealed_manifest",
+        "finally:",
+        "ensure_kaggle_cli",
+        "kaggle --version",
+        "git_validation",
+        "20 GiB Kaggle working limit",
+    )
+    _assert_contains(runner, required, source=RUNNER.name)
+    forbidden = ("forbidden_names", "commit_from_copy")
+    present = [item for item in forbidden if item in runner]
+    if present:
+        raise AssertionError(f"{RUNNER.name} contains obsolete blocker-prone code: {present}")
+
+
 def validate() -> None:
     runner = _read(RUNNER)
     guide = _read(GUIDE)
-    ast.parse(runner, filename=str(RUNNER))
+    tree = _module_tree(runner)
 
     required_runner_terms = (
         "/kaggle/input/causaldem-poc-source",
@@ -58,13 +172,16 @@ def validate() -> None:
         "1",
         "--checkpoint-root",
         "kaggle datasets version",
+        "kaggle --version",
         "UserSecretsClient",
         "COMMIT_SHA.txt",
     )
     _assert_contains(runner, required_runner_terms, source=RUNNER.name)
+    _assert_required_runner_structure(runner, tree)
 
     required_guide_terms = (
         "Kaggle free CPU",
+        "20 GiB auto-saved",
         "private Kaggle Dataset",
         "private source dataset",
         "private checkpoint dataset",
@@ -81,6 +198,10 @@ def validate() -> None:
         "12-hour",
         "Kaggle Secret",
         "sealed manifest",
+        "deleted in a finally block",
+        "exact allowlist",
+        "sharded checkpoint",
+        "kaggle --version",
         "final local verification",
         "Do not paste",
     )

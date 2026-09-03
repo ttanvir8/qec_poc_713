@@ -1,9 +1,13 @@
 # Kaggle Pilot Run How-To
 
 This guide runs the CausalDEM-QEC pilot on the Kaggle free CPU tier. It uses the
-existing package CLI and writes only private checkpoint artifacts. Do not paste
-actual secrets or raw seed values into the notebook, this guide, Git, notebook
-metadata, or any Kaggle Dataset output.
+existing package CLI and writes only private checkpoint artifacts. Kaggle's
+auto-saved working directory has a 20 GiB auto-saved limit, so this workflow
+fails before attempting a full checkpoint copy/export that cannot fit. Use a
+sharded checkpoint dataset small enough for one copy plus one export, or run the
+checkpoint export on persistent storage. Do not paste actual secrets or raw seed
+values into the notebook, this guide, Git, notebook metadata, or any Kaggle
+Dataset output.
 
 ## 1. Prepare private local inputs
 
@@ -61,8 +65,9 @@ metadata, or any Kaggle Dataset output.
    copied source directory.
 3. The first cells verify the runtime and print Python, platform, disk, RAM, and
    elapsed-time checks. Stop if Python is not 3.11, if working storage is near
-   18 GiB used, if less than 2 GiB is free, or if the notebook is too close to
-   the 12-hour session limit.
+   18 GiB used, if less than 2 GiB is free, if the checkpoint cannot fit within
+   the 20 GiB auto-saved working limit with an export copy, or if the notebook is
+   too close to the 12-hour session limit.
 4. The setup installs and verifies the frozen dependency set:
 
    ```bash
@@ -71,8 +76,10 @@ metadata, or any Kaggle Dataset output.
 
    Do not regenerate `uv.lock` in Kaggle.
 5. The source commit check compares the attached private source dataset's
-   `COMMIT_SHA.txt` to the copied source tree and, when `.git` is present, to
-   `git rev-parse HEAD`.
+   `COMMIT_SHA.txt`, and, when `.git` is present in the input dataset, to
+   `git rev-parse HEAD`. If `.git` is absent, the runner records that Git
+   validation was unavailable instead of comparing the marker to its own copied
+   copy.
 6. The checkpoint copy step copies the private checkpoint dataset into
    `/kaggle/working/runs/pilot`. The notebook never writes into
    `/kaggle/input`.
@@ -140,9 +147,13 @@ free CPU tier.
 
 After a successful job, the CLI exports a checkpoint to
 `/kaggle/working/export/pilot`. The export is uploadable only if it contains the
-manifest and verified artifact files, and excludes source code, secrets,
-staging directories, logs containing sensitive values, `.superpowers/`,
-`.worktrees/`, notebook outputs, and scratch files.
+manifest and verified artifact files. The runner validates the checkpoint
+payload with an exact allowlist: `pilot/run_manifest.json` plus
+`arrays.npz`, `metadata.json`, and `SHA256SUMS` files under the observable and
+label artifact lanes. Source code, secrets, staging directories, logs containing
+sensitive values, `.superpowers/`, `.worktrees/`, notebook outputs, scratch
+files, symlinks, and any other path are rejected because they are not on that
+allowlist.
 
 The runner checks the export root before upload. If generation completed but no
 export exists, stop and inspect the CLI output; do not publish a partial
@@ -168,6 +179,11 @@ kaggle datasets version \
 Record the returned Kaggle Dataset version or timestamp in local run notes. In
 the next Kaggle session, attach that exact private checkpoint dataset version
 instead of relying on a mutable latest pointer.
+
+Before either create or version, the runner checks the Kaggle CLI capability
+with `kaggle --version`. If the command is unavailable, it installs the CLI with
+`uv tool install kaggle` and checks again before reading Kaggle Secrets or
+attempting upload.
 
 ## 9. Storage, time, and retry rules
 
@@ -196,6 +212,11 @@ sealed commitment hash recorded by the current artifact APIs.
 
 Set `CAUSALDEM_USE_SEALED_MANIFEST=1` only for sessions expected to schedule
 sealed jobs. Leave it unset for normal and development jobs.
+
+When a sealed secret is used, the runner writes it only to
+`/kaggle/working/secrets/causaldem_pilot_sealed.json`; that session-local file
+is deleted in a finally block after generation and verification, including when
+generation fails.
 
 ## 11. Final local verification
 
