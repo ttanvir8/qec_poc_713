@@ -1,0 +1,435 @@
+"""Kaggle notebook runner for the CausalDEM-QEC pilot checkpoint loop.
+
+Paste this file into a private Kaggle CPU notebook as cells, or upload it with
+the private source dataset and run it with `python kaggle_pilot_runner.py`.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# %% [markdown]
+# # CausalDEM-QEC Kaggle Pilot Runner
+#
+# Attach these private Kaggle Datasets before running:
+#
+# - `causaldem-poc-source`, containing the public source tree and COMMIT_SHA.txt.
+# - The newest private pilot checkpoint dataset, containing `pilot/run_manifest.json`.
+#
+# Keep Internet on only while installing dependencies and publishing the private
+# checkpoint dataset version.
+
+# %%
+SOURCE_INPUT = Path("/kaggle/input/causaldem-poc-source")
+CHECKPOINT_INPUT = Path(os.environ.get("CAUSALDEM_CHECKPOINT_INPUT", ""))
+if not str(CHECKPOINT_INPUT):
+    CHECKPOINT_INPUT = Path("/kaggle/input/causaldem-pilot-checkpoint-00")
+
+WORKING_SOURCE = Path("/kaggle/working/source")
+WORKING_ROOT = Path("/kaggle/working/runs/pilot")
+EXPORT_ROOT = Path("/kaggle/working/export")
+EXPORT_PILOT = EXPORT_ROOT / "pilot"
+# Expected checkpoint-root literal for review: /kaggle/working/export/pilot
+SECRET_DIR = Path("/kaggle/working/secrets")
+SEALED_MANIFEST_PATH = SECRET_DIR / "causaldem_pilot_sealed.json"
+
+CONFIG = Path("configs/poc_pilot.json")
+JOB_LIMIT = "1"
+WORKING_STORAGE_STOP_GIB = 18
+MIN_FREE_GIB = 2
+SESSION_LIMIT_SECONDS = 12 * 60 * 60
+STOP_BEFORE_LIMIT_SECONDS = 45 * 60
+
+
+def run(command: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
+    print("+", " ".join(command))
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        env=env,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if completed.stdout:
+        print(completed.stdout)
+    return completed.stdout
+
+
+def mem_available_gib() -> float:
+    for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) / 1024 / 1024
+    raise RuntimeError("cannot read MemAvailable from /proc/meminfo")
+
+
+def disk_report(path: Path) -> dict[str, float]:
+    usage = shutil.disk_usage(path)
+    return {
+        "total_gib": usage.total / 1024**3,
+        "used_gib": usage.used / 1024**3,
+        "free_gib": usage.free / 1024**3,
+    }
+
+
+def assert_runtime_budget(started_at: float) -> None:
+    disk = disk_report(Path("/kaggle/working"))
+    elapsed = time.monotonic() - started_at
+    remaining = SESSION_LIMIT_SECONDS - elapsed
+    print(
+        json.dumps(
+            {
+                "python": sys.version,
+                "platform": platform.platform(),
+                "disk": disk,
+                "mem_available_gib": mem_available_gib(),
+                "elapsed_seconds": elapsed,
+                "estimated_remaining_seconds": remaining,
+            },
+            indent=2,
+        )
+    )
+    if sys.version_info[:2] != (3, 11):
+        raise RuntimeError("Kaggle runtime must use Python 3.11 for the locked environment")
+    if disk["used_gib"] >= WORKING_STORAGE_STOP_GIB:
+        raise RuntimeError("working storage is at or above the 18 GiB stop threshold")
+    if disk["free_gib"] < MIN_FREE_GIB:
+        raise RuntimeError("working storage has less than the minimum free-space reserve")
+    if remaining < STOP_BEFORE_LIMIT_SECONDS:
+        raise RuntimeError("too close to the 12-hour Kaggle session limit for another job")
+
+
+# %%
+started_at = time.monotonic()
+assert_runtime_budget(started_at)
+
+# %%
+run([sys.executable, "-m", "pip", "install", "-q", "uv"])
+
+
+def locate_source_root(source_input: Path) -> Path:
+    candidates = [source_input, *[path for path in source_input.iterdir() if path.is_dir()]]
+    for candidate in candidates:
+        if (candidate / "pyproject.toml").is_file() and (candidate / "uv.lock").is_file():
+            return candidate
+    raise RuntimeError("source dataset must contain pyproject.toml and uv.lock")
+
+
+def copy_source() -> Path:
+    source_root = locate_source_root(SOURCE_INPUT)
+    if WORKING_SOURCE.exists():
+        raise RuntimeError(f"{WORKING_SOURCE} already exists; inspect before reuse")
+    shutil.copytree(
+        source_root,
+        WORKING_SOURCE,
+        ignore=shutil.ignore_patterns(
+            ".superpowers",
+            ".worktrees",
+            "runs",
+            "reports",
+            "data",
+            "__pycache__",
+            ".pytest_cache",
+            ".ruff_cache",
+        ),
+    )
+    commit_from_input = (source_root / "COMMIT_SHA.txt").read_text(encoding="utf-8").strip()
+    commit_from_copy = (WORKING_SOURCE / "COMMIT_SHA.txt").read_text(encoding="utf-8").strip()
+    if not commit_from_input or commit_from_input != commit_from_copy:
+        raise RuntimeError("source commit marker mismatch")
+    if (WORKING_SOURCE / ".git").exists():
+        git_commit = run(["git", "rev-parse", "HEAD"], cwd=WORKING_SOURCE).strip()
+        if git_commit != commit_from_copy:
+            raise RuntimeError("source commit does not match COMMIT_SHA.txt")
+    print(json.dumps({"source_commit": commit_from_copy}))
+    return WORKING_SOURCE
+
+
+REPO = copy_source()
+
+# %%
+# Keep this exact command text for notebook review: uv sync --frozen --extra dev
+run(["uv", "sync", "--frozen", "--extra", "dev"], cwd=REPO)
+run(
+    [
+        "uv",
+        "run",
+        "python",
+        "-c",
+        (
+            "import importlib.metadata as m; "
+            "print({name: m.version(name) for name in "
+            "('numpy','scipy','stim','pymatching','pyarrow')})"
+        ),
+    ],
+    cwd=REPO,
+)
+
+
+# %%
+def locate_checkpoint_root(checkpoint_input: Path) -> Path:
+    candidates = [
+        checkpoint_input / "pilot",
+        checkpoint_input,
+        *[path / "pilot" for path in checkpoint_input.iterdir() if path.is_dir()],
+    ]
+    for candidate in candidates:
+        if (candidate / "run_manifest.json").is_file():
+            return candidate
+    raise RuntimeError("checkpoint dataset must contain pilot/run_manifest.json")
+
+
+def copy_checkpoint() -> None:
+    checkpoint_root = locate_checkpoint_root(CHECKPOINT_INPUT)
+    if WORKING_ROOT.exists():
+        raise RuntimeError(f"{WORKING_ROOT} already exists; inspect before reuse")
+    WORKING_ROOT.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(checkpoint_root, WORKING_ROOT)
+    print(
+        json.dumps({"copied_checkpoint": str(checkpoint_root), "working_root": str(WORKING_ROOT)})
+    )
+
+
+copy_checkpoint()
+assert_runtime_budget(started_at)
+
+
+# %%
+def build_expected_provenance() -> object:
+    from causaldem_qec.core import ManifestProvenance
+    from causaldem_qec.simulate import STANDARD_GENERATION_LAW_VERSION
+
+    source_commit = (REPO / "COMMIT_SHA.txt").read_text(encoding="utf-8").strip()
+    checkpoint_identity = f"checkpoint-root:{EXPORT_PILOT.resolve()}"
+    return ManifestProvenance(
+        source_commit=source_commit,
+        execution_backend="kaggle",
+        generation_law_version=STANDARD_GENERATION_LAW_VERSION,
+        checkpoint_identity=checkpoint_identity,
+    )
+
+
+def resolved_pilot_config_hash() -> str:
+    from causaldem_qec.core import load_spec
+    from causaldem_qec.simulate import _resolved_config_hash
+
+    return _resolved_config_hash(load_spec(REPO / CONFIG))
+
+
+def upgrade_legacy_bootstrap_if_needed() -> None:
+    from causaldem_qec.artifacts import (
+        ArtifactConflict,
+        inventory_checkpoint,
+        upgrade_legacy_kaggle_bootstrap,
+    )
+
+    expected_provenance = build_expected_provenance()
+    expected_hash = resolved_pilot_config_hash()
+    manifest_path = WORKING_ROOT / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if "provenance" in manifest:
+        inventory_checkpoint(
+            WORKING_ROOT,
+            expected_config_hash=expected_hash,
+            expected_provenance=expected_provenance,
+        )
+        print("checkpoint already provenance-bound")
+        return
+    try:
+        upgrade_legacy_kaggle_bootstrap(
+            WORKING_ROOT,
+            expected_config_hash=expected_hash,
+            expected_provenance=expected_provenance,
+        )
+        print("legacy bootstrap manifest upgraded")
+    except ArtifactConflict as error:
+        raise RuntimeError("legacy bootstrap manifest upgrade failed") from error
+
+
+upgrade_legacy_bootstrap_if_needed()
+
+# %%
+run(
+    [
+        "uv",
+        "run",
+        "causaldem-poc",
+        "verify-dataset",
+        "--config",
+        str(CONFIG),
+        "--output-root",
+        str(WORKING_ROOT),
+    ],
+    cwd=REPO,
+)
+assert_runtime_budget(started_at)
+
+
+# %%
+def write_sealed_manifest_from_secret() -> list[str]:
+    use_sealed = os.environ.get("CAUSALDEM_USE_SEALED_MANIFEST", "").lower() in {"1", "true", "yes"}
+    if not use_sealed:
+        return []
+    from kaggle_secrets import UserSecretsClient
+
+    secret_value = UserSecretsClient().get_secret("CAUSALDEM_PILOT_SEALED_MANIFEST")
+    if not secret_value:
+        raise RuntimeError("sealed manifest Kaggle Secret is empty")
+    SECRET_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(SEALED_MANIFEST_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(secret_value)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return ["--sealed-manifest", str(SEALED_MANIFEST_PATH)]
+
+
+sealed_args = write_sealed_manifest_from_secret()
+
+# %%
+generate_command = [
+    "uv",
+    "run",
+    "causaldem-poc",
+    "generate-pilot",
+    "--config",
+    str(CONFIG),
+    "--output-root",
+    str(WORKING_ROOT),
+    "--workers",
+    "1",
+    "--execution-backend",
+    "kaggle",
+    "--job-limit",
+    JOB_LIMIT,
+    "--checkpoint-root",
+    str(EXPORT_PILOT),
+    *sealed_args,
+]
+run(generate_command, cwd=REPO)
+assert_runtime_budget(started_at)
+
+# %%
+run(
+    [
+        "uv",
+        "run",
+        "causaldem-poc",
+        "verify-dataset",
+        "--config",
+        str(CONFIG),
+        "--output-root",
+        str(WORKING_ROOT),
+    ],
+    cwd=REPO,
+)
+
+
+# %%
+def assert_export_is_uploadable() -> None:
+    if not (EXPORT_PILOT / "run_manifest.json").is_file():
+        raise RuntimeError("checkpoint export was not produced; inspect generation status")
+    forbidden_names = {
+        ".superpowers",
+        ".worktrees",
+        "source",
+        "secrets",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+    }
+    for path in EXPORT_ROOT.rglob("*"):
+        parts = set(path.relative_to(EXPORT_ROOT).parts)
+        if parts & forbidden_names:
+            raise RuntimeError(f"forbidden path in export staging: {path}")
+        if path.is_symlink():
+            raise RuntimeError(f"symlink in export staging: {path}")
+    manifest = json.loads((EXPORT_PILOT / "run_manifest.json").read_text(encoding="utf-8"))
+    completed = sum(item.get("completed") is True for item in manifest["results"])
+    print(json.dumps({"export_root": str(EXPORT_ROOT), "completed_pairs": completed}))
+
+
+assert_export_is_uploadable()
+
+
+# %%
+def configure_kaggle_credentials() -> None:
+    from kaggle_secrets import UserSecretsClient
+
+    client = UserSecretsClient()
+    os.environ["KAGGLE_USERNAME"] = client.get_secret("KAGGLE_USERNAME")
+    os.environ["KAGGLE_KEY"] = client.get_secret("KAGGLE_KEY")
+    if not os.environ["KAGGLE_USERNAME"] or not os.environ["KAGGLE_KEY"]:
+        raise RuntimeError("Kaggle API credentials are missing")
+
+
+def write_dataset_metadata() -> tuple[str, str]:
+    owner_slug = os.environ.get("CAUSALDEM_CHECKPOINT_DATASET_SLUG", "").strip()
+    if not owner_slug or "/" not in owner_slug:
+        raise RuntimeError("set CAUSALDEM_CHECKPOINT_DATASET_SLUG to owner/dataset-slug")
+    owner, slug = owner_slug.split("/", 1)
+    metadata = {
+        "id": f"{owner}/{slug}",
+        "title": "CausalDEM-QEC pilot checkpoint",
+        "licenses": [{"name": "CC0-1.0"}],
+    }
+    EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+    (EXPORT_ROOT / "dataset-metadata.json").write_text(
+        json.dumps(metadata, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return owner_slug, slug
+
+
+def publish_private_checkpoint() -> None:
+    configure_kaggle_credentials()
+    owner_slug, _slug = write_dataset_metadata()
+    manifest = json.loads((EXPORT_PILOT / "run_manifest.json").read_text(encoding="utf-8"))
+    completed = sum(item.get("completed") is True for item in manifest["results"])
+    source_commit = (REPO / "COMMIT_SHA.txt").read_text(encoding="utf-8").strip()
+    message = f"pilot checkpoint: completed {completed} of 88; source {source_commit}"
+    create_first = os.environ.get("CAUSALDEM_CREATE_CHECKPOINT_DATASET", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if create_first:
+        run(
+            [
+                "kaggle",
+                "datasets",
+                "create",
+                "-p",
+                str(EXPORT_ROOT),
+                "--private",
+                "--dir-mode",
+                "zip",
+            ]
+        )
+    else:
+        # Kaggle private checkpoint upload command: kaggle datasets version
+        run(
+            [
+                "kaggle",
+                "datasets",
+                "version",
+                "-p",
+                str(EXPORT_ROOT),
+                "-m",
+                message,
+                "--dir-mode",
+                "zip",
+            ]
+        )
+    print(json.dumps({"private_dataset": owner_slug, "version_message": message}))
+
+
+publish_private_checkpoint()
