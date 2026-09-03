@@ -24,6 +24,7 @@ from causaldem_qec.core import (
     ObservableTrajectory,
     TrajectoryJob,
     deserialize_manifest_provenance,
+    parse_checkpoint_version,
     serialize_manifest_provenance,
     validate_labels,
     validate_observable,
@@ -618,7 +619,8 @@ def _checkpoint_lane_index(
 def _validate_checkpoint_expectations(
     expected_config_hash: object,
     expected_provenance: object,
-) -> tuple[str, ManifestProvenance]:
+    expected_checkpoint_version: object,
+) -> tuple[str, ManifestProvenance, str, int]:
     if (
         not isinstance(expected_config_hash, str)
         or not _is_sha256_digest(expected_config_hash)
@@ -627,7 +629,14 @@ def _validate_checkpoint_expectations(
         or expected_provenance.checkpoint_identity is None
     ):
         raise ArtifactConflict("invalid expected checkpoint identity")
-    return expected_config_hash, expected_provenance
+    try:
+        version, version_number = parse_checkpoint_version(
+            expected_provenance.checkpoint_identity,
+            expected_checkpoint_version,
+        )
+    except ValueError as error:
+        raise ArtifactConflict("invalid expected checkpoint identity or version") from error
+    return expected_config_hash, expected_provenance, version, version_number
 
 
 def _read_checkpoint_manifest(root: Path) -> Mapping[str, object]:
@@ -652,9 +661,14 @@ def _checkpoint_manifest(
     *,
     expected_config_hash: str,
     expected_provenance: ManifestProvenance,
+    expected_checkpoint_version: str,
 ) -> Mapping[str, object]:
-    expected_config_hash, expected_provenance = _validate_checkpoint_expectations(
-        expected_config_hash, expected_provenance
+    expected_config_hash, expected_provenance, _, expected_version_number = (
+        _validate_checkpoint_expectations(
+            expected_config_hash,
+            expected_provenance,
+            expected_checkpoint_version,
+        )
     )
     value = _read_checkpoint_manifest(root)
     try:
@@ -672,6 +686,15 @@ def _checkpoint_manifest(
         or provenance != expected_provenance
     ):
         raise ArtifactConflict("checkpoint manifest identity mismatch")
+    try:
+        _, recorded_version_number = parse_checkpoint_version(
+            expected_provenance.checkpoint_identity,
+            value.get("checkpoint_input_version"),
+        )
+    except ValueError as error:
+        raise ArtifactConflict("checkpoint manifest version is invalid") from error
+    if recorded_version_number > expected_version_number:
+        raise ArtifactConflict("checkpoint manifest version is newer than the attached version")
     return value
 
 
@@ -806,12 +829,14 @@ def inventory_checkpoint(
     *,
     expected_config_hash: str,
     expected_provenance: ManifestProvenance,
+    expected_checkpoint_version: str,
 ) -> tuple[CheckpointPair, ...]:
     """Return pairs verified against identity supplied outside the checkpoint."""
     manifest = _checkpoint_manifest(
         root,
         expected_config_hash=expected_config_hash,
         expected_provenance=expected_provenance,
+        expected_checkpoint_version=expected_checkpoint_version,
     )
     return _inventory_checkpoint(root, manifest)
 
@@ -887,10 +912,15 @@ def upgrade_legacy_kaggle_bootstrap(
     *,
     expected_config_hash: str,
     expected_provenance: ManifestProvenance,
+    expected_checkpoint_version: str,
 ) -> Path:
     """Validate and provenance-bind only the original 44-pair pilot bootstrap."""
-    expected_config_hash, expected_provenance = _validate_checkpoint_expectations(
-        expected_config_hash, expected_provenance
+    expected_config_hash, expected_provenance, expected_checkpoint_version, _ = (
+        _validate_checkpoint_expectations(
+            expected_config_hash,
+            expected_provenance,
+            expected_checkpoint_version,
+        )
     )
     manifest = _read_checkpoint_manifest(root)
     results = manifest.get("results")
@@ -944,6 +974,7 @@ def upgrade_legacy_kaggle_bootstrap(
         raise ArtifactConflict("legacy bootstrap artifact identity mismatch")
     upgraded_manifest = dict(validated_manifest)
     upgraded_manifest["provenance"] = serialize_manifest_provenance(expected_provenance)
+    upgraded_manifest["checkpoint_input_version"] = expected_checkpoint_version
     manifest_path = root / "run_manifest.json"
     _atomic_write(manifest_path, lambda temporary: _write_json(temporary, upgraded_manifest))
     return manifest_path
@@ -979,6 +1010,7 @@ def _checkpoint_export_matches(
     inventory: tuple[CheckpointPair, ...],
     expected_config_hash: str,
     expected_provenance: ManifestProvenance,
+    expected_checkpoint_version: str,
 ) -> bool:
     try:
         if destination.is_symlink() or not destination.is_dir():
@@ -995,6 +1027,7 @@ def _checkpoint_export_matches(
                 destination,
                 expected_config_hash=expected_config_hash,
                 expected_provenance=expected_provenance,
+                expected_checkpoint_version=expected_checkpoint_version,
             )
             != inventory
         ):
@@ -1015,6 +1048,7 @@ def _publish_checkpoint_export(
     inventory: tuple[CheckpointPair, ...],
     expected_config_hash: str,
     expected_provenance: ManifestProvenance,
+    expected_checkpoint_version: str,
 ) -> None:
     try:
         _rename_no_replace(staging, destination)
@@ -1025,6 +1059,7 @@ def _publish_checkpoint_export(
             inventory,
             expected_config_hash,
             expected_provenance,
+            expected_checkpoint_version,
         ):
             shutil.rmtree(staging)
             return
@@ -1048,6 +1083,7 @@ def _publish_checkpoint_export(
                     inventory,
                     expected_config_hash,
                     expected_provenance,
+                    expected_checkpoint_version,
                 ):
                     shutil.rmtree(staging)
                     return
@@ -1067,12 +1103,14 @@ def export_checkpoint(
     *,
     expected_config_hash: str,
     expected_provenance: ManifestProvenance,
+    expected_checkpoint_version: str,
 ) -> Path:
     """Atomically export a manifest and its verified artifact pairs."""
     inventory = inventory_checkpoint(
         source,
         expected_config_hash=expected_config_hash,
         expected_provenance=expected_provenance,
+        expected_checkpoint_version=expected_checkpoint_version,
     )
     if destination.exists():
         if _checkpoint_export_matches(
@@ -1081,6 +1119,7 @@ def export_checkpoint(
             inventory,
             expected_config_hash,
             expected_provenance,
+            expected_checkpoint_version,
         ):
             return destination
         raise ArtifactConflict(f"checkpoint export conflict: {destination}")
@@ -1109,6 +1148,7 @@ def export_checkpoint(
                 staging,
                 expected_config_hash=expected_config_hash,
                 expected_provenance=expected_provenance,
+                expected_checkpoint_version=expected_checkpoint_version,
             )
             != inventory
         ):
@@ -1120,6 +1160,7 @@ def export_checkpoint(
             inventory,
             expected_config_hash,
             expected_provenance,
+            expected_checkpoint_version,
         )
         return destination
     finally:

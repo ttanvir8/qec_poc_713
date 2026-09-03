@@ -56,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--job-limit", type=int)
     parser.add_argument("--checkpoint-root", type=Path)
     parser.add_argument("--checkpoint-identity")
+    parser.add_argument("--checkpoint-version")
     parser.add_argument("--sealed-manifest", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--reports-root", type=Path, default=Path("reports/dataset_eda"))
@@ -194,15 +195,18 @@ def _execution_context(
         execution_backend=args.execution_backend,
         job_limit=args.job_limit,
         checkpoint_identity=args.checkpoint_identity,
+        checkpoint_version=args.checkpoint_version,
     )
     if options.execution_backend == "local":
         if (
             args.job_limit is not None
             or args.checkpoint_root is not None
             or args.checkpoint_identity is not None
+            or args.checkpoint_version is not None
         ):
             raise ValueError(
-                "--job-limit, --checkpoint-root, and --checkpoint-identity require "
+                "--job-limit, --checkpoint-root, --checkpoint-identity, and "
+                "--checkpoint-version require "
                 "--execution-backend kaggle"
             )
         return options, None
@@ -212,10 +216,12 @@ def _execution_context(
         options.job_limit is None
         or args.checkpoint_root is None
         or options.checkpoint_identity is None
+        or options.checkpoint_version is None
     ):
         raise ValueError(
             "kaggle execution requires --job-limit, --checkpoint-root, and an externally "
-            "supplied checkpoint identity via --checkpoint-identity"
+            "supplied checkpoint identity and version via --checkpoint-identity and "
+            "--checkpoint-version"
         )
     if args.workers != 1:
         raise ValueError("kaggle execution requires --workers 1")
@@ -288,6 +294,7 @@ def _pilot_status(
                 if checkpoint_root is None
                 else str(checkpoint_root.resolve()),
                 "checkpoint_identity": execution_options.checkpoint_identity,
+                "checkpoint_input_version": execution_options.checkpoint_version,
             }
         )
     return status
@@ -321,7 +328,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.stage == "generate-pilot":
         _require_pilot_config(args.config, spec)
         if execution_options.execution_backend == "kaggle":
-            assert_run_manifest_identity(args.output_root, spec, provenance)
+            assert_run_manifest_identity(
+                args.output_root,
+                spec,
+                provenance,
+                checkpoint_version=execution_options.checkpoint_version,
+            )
             probe = args.output_root.resolve()
             while not probe.exists():
                 probe = probe.parent

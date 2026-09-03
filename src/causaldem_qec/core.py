@@ -72,11 +72,35 @@ def normalize_execution_backend(value: object) -> ExecutionBackend:
     return cast(ExecutionBackend, normalized)
 
 
+def parse_checkpoint_version(
+    checkpoint_identity: object, checkpoint_version: object
+) -> tuple[str, int]:
+    """Validate a stable Kaggle dataset slug and its immutable numbered version."""
+    identity = _normalized_nonempty(checkpoint_identity, "checkpoint identity")
+    allowed = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    identity_parts = identity.split("/")
+    if len(identity_parts) != 2 or any(
+        not part or any(character not in allowed for character in part) for part in identity_parts
+    ):
+        raise ValueError("checkpoint identity must be an owner/dataset slug")
+    version = _normalized_nonempty(checkpoint_version, "checkpoint version")
+    version_identity, separator, number = version.rpartition("@")
+    if separator != "@" or version_identity != identity or not number.isdecimal():
+        raise ValueError(
+            "checkpoint version must match checkpoint identity as owner/dataset@number"
+        )
+    version_number = int(number)
+    if version_number < 1 or str(version_number) != number:
+        raise ValueError("checkpoint version number must be a positive canonical integer")
+    return version, version_number
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionOptions:
     execution_backend: ExecutionBackend = "local"
     job_limit: int | None = None
     checkpoint_identity: str | None = None
+    checkpoint_version: str | None = None
     generation_mode: GenerationMode = "standard"
     generation_chunk_rounds: int | None = None
 
@@ -96,6 +120,14 @@ class ExecutionOptions:
                 "checkpoint_identity",
                 _normalized_nonempty(self.checkpoint_identity, "checkpoint identity"),
             )
+        if self.checkpoint_version is not None:
+            object.__setattr__(
+                self,
+                "checkpoint_version",
+                _normalized_nonempty(self.checkpoint_version, "checkpoint version"),
+            )
+        if self.checkpoint_identity is not None and self.checkpoint_version is not None:
+            parse_checkpoint_version(self.checkpoint_identity, self.checkpoint_version)
         mode = _normalized_nonempty(self.generation_mode, "generation mode").lower()
         if mode not in _GENERATION_MODES:
             raise ValueError(f"unsupported generation mode: {self.generation_mode}")

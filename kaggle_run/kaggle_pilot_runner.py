@@ -42,19 +42,29 @@ def resolve_checkpoint_input(raw_value: str | None) -> Path:
 CHECKPOINT_INPUT = resolve_checkpoint_input(os.environ.get("CAUSALDEM_CHECKPOINT_INPUT"))
 
 
-def require_checkpoint_identity(raw_value: str | None) -> str:
+def require_checkpoint_dataset_identity(raw_value: str | None) -> str:
     value = (raw_value or "").strip()
-    dataset_version = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[1-9][0-9]*"
-    content_digest = r"sha256:[0-9a-f]{64}"
-    if not value or re.fullmatch(f"(?:{dataset_version}|{content_digest})", value) is None:
+    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value) is None:
+        raise RuntimeError("set CAUSALDEM_CHECKPOINT_DATASET_SLUG to the stable owner/dataset slug")
+    return value
+
+
+def require_checkpoint_version(raw_value: str | None, checkpoint_identity: str) -> str:
+    value = (raw_value or "").strip()
+    if re.fullmatch(re.escape(checkpoint_identity) + r"@[1-9][0-9]*", value) is None:
         raise RuntimeError(
-            "set CAUSALDEM_CHECKPOINT_VERSION to the exact attached checkpoint dataset "
-            "version (owner/dataset@number) or a sha256 content digest"
+            "set CAUSALDEM_CHECKPOINT_VERSION to the exact attached version of "
+            f"{checkpoint_identity} in owner/dataset@number form"
         )
     return value
 
 
-CHECKPOINT_IDENTITY = require_checkpoint_identity(os.environ.get("CAUSALDEM_CHECKPOINT_VERSION"))
+CHECKPOINT_IDENTITY = require_checkpoint_dataset_identity(
+    os.environ.get("CAUSALDEM_CHECKPOINT_DATASET_SLUG")
+)
+CHECKPOINT_VERSION = require_checkpoint_version(
+    os.environ.get("CAUSALDEM_CHECKPOINT_VERSION"), CHECKPOINT_IDENTITY
+)
 
 WORKING_SOURCE = Path("/kaggle/working/source")
 WORKING_ROOT = Path("/kaggle/working/runs/pilot")
@@ -310,6 +320,7 @@ repo = Path({str(REPO)!r})
 config = Path({str(CONFIG)!r})
 working_root = Path({str(WORKING_ROOT)!r})
 checkpoint_identity = {CHECKPOINT_IDENTITY!r}
+checkpoint_version = {CHECKPOINT_VERSION!r}
 
 source_commit = (repo / "COMMIT_SHA.txt").read_text(encoding="utf-8").strip()
 expected_provenance = ManifestProvenance(
@@ -326,6 +337,7 @@ if "provenance" in manifest:
         working_root,
         expected_config_hash=expected_hash,
         expected_provenance=expected_provenance,
+        expected_checkpoint_version=checkpoint_version,
     )
     print("checkpoint already provenance-bound")
 else:
@@ -334,6 +346,7 @@ else:
             working_root,
             expected_config_hash=expected_hash,
             expected_provenance=expected_provenance,
+            expected_checkpoint_version=checkpoint_version,
         )
     except ArtifactConflict as error:
         raise RuntimeError("legacy bootstrap manifest upgrade failed") from error
@@ -412,6 +425,8 @@ try:
         str(EXPORT_PILOT),
         "--checkpoint-identity",
         CHECKPOINT_IDENTITY,
+        "--checkpoint-version",
+        CHECKPOINT_VERSION,
         *sealed_args,
     ]
     run(generate_command, cwd=REPO)
@@ -499,9 +514,7 @@ def configure_kaggle_credentials() -> None:
 
 
 def write_dataset_metadata() -> tuple[str, str]:
-    owner_slug = os.environ.get("CAUSALDEM_CHECKPOINT_DATASET_SLUG", "").strip()
-    if not owner_slug or "/" not in owner_slug:
-        raise RuntimeError("set CAUSALDEM_CHECKPOINT_DATASET_SLUG to owner/dataset-slug")
+    owner_slug = CHECKPOINT_IDENTITY
     owner, slug = owner_slug.split("/", 1)
     metadata = {
         "id": f"{owner}/{slug}",

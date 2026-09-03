@@ -58,11 +58,13 @@ Dataset output.
    ```
 
    For later versions, remove `CAUSALDEM_CREATE_CHECKPOINT_DATASET` or set it to
-   `0`. Set `CAUSALDEM_CHECKPOINT_VERSION` from the exact attached checkpoint dataset version
-   shown for the pinned input. A verified
-   `sha256:<64 lowercase hex>`
-   checkpoint content digest is also accepted. The runner refuses to start when
-   this immutable external identity is absent or malformed.
+   `0`. `CAUSALDEM_CHECKPOINT_DATASET_SLUG` is the stable dataset identity and
+   stays unchanged across versions; it is recorded as provenance
+   `checkpoint_identity`. Set `CAUSALDEM_CHECKPOINT_VERSION` from the exact
+   exact attached checkpoint dataset version shown for the pinned input, in
+   `owner/dataset@number` form. It is recorded separately as
+   `checkpoint_input_version`. The runner refuses to start if either value is
+   absent, malformed, or names a different dataset.
 
 ## 3. Run the notebook asset
 
@@ -137,7 +139,8 @@ uv run causaldem-poc generate-pilot \
   --execution-backend kaggle \
   --job-limit 1 \
   --checkpoint-root /kaggle/working/export/pilot \
-  --checkpoint-identity your-kaggle-name/causaldem-pilot-checkpoint@7
+  --checkpoint-identity your-kaggle-name/causaldem-pilot-checkpoint \
+  --checkpoint-version your-kaggle-name/causaldem-pilot-checkpoint@7
 ```
 
 For sealed jobs, the runner adds:
@@ -212,9 +215,11 @@ Use these thresholds on Kaggle free CPU:
 - If upload fails, retry the upload from the same verified
   `/kaggle/working/export` directory. Do not regenerate the just-completed pair
   merely because publishing failed.
-- If source commit, config hash, execution backend, checkpoint identity,
-  artifact checksum, pair ID, or sealed commitment checks fail, stop and attach
-  the correct dataset version.
+- If source commit, config hash, execution backend, stable checkpoint dataset
+  identity, attached checkpoint version, artifact checksum, pair ID, or sealed
+  commitment checks fail, stop and attach the correct dataset version. A
+  checkpoint created from version `@N` may resume from the same dataset at
+  `@N+1`; a different dataset slug or a version rollback is rejected.
 
 ## 10. Sealed manifest handling
 

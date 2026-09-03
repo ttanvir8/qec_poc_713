@@ -40,11 +40,13 @@ from causaldem_qec.core import (
 CONFIG = Path("configs/poc.json")
 PILOT_CONFIG = Path("configs/poc_pilot.json")
 CHECKPOINT_CONFIG_HASH = "a" * 64
+CHECKPOINT_IDENTITY = "owner/causaldem-pilot-checkpoint"
+CHECKPOINT_VERSION = f"{CHECKPOINT_IDENTITY}@7"
 CHECKPOINT_PROVENANCE = ManifestProvenance(
     source_commit="256488b",
     execution_backend="kaggle",
     generation_law_version="standard_monolithic_v1",
-    checkpoint_identity="pilot-checkpoint:2",
+    checkpoint_identity=CHECKPOINT_IDENTITY,
 )
 CHECKPOINT_SEALED_COMMITMENT = {"algorithm": "sha256", "digest": "b" * 64}
 LEGACY_CHECKPOINT_CONFIG_HASH = "bcd3d21f1a013da6767b935bc6d452f927d13d2ec4ef0fc3326145a55a01d09c"
@@ -54,7 +56,8 @@ def test_execution_options_are_frozen_and_normalize_the_backend() -> None:
     options = ExecutionOptions(
         execution_backend=" KAGGLE ",
         job_limit=1,
-        checkpoint_identity="causaldem-pilot-checkpoint:7",
+        checkpoint_identity=CHECKPOINT_IDENTITY,
+        checkpoint_version=CHECKPOINT_VERSION,
         generation_mode="bounded",
         generation_chunk_rounds=256,
     )
@@ -75,6 +78,7 @@ def test_execution_options_reject_unknown_backends(backend: str) -> None:
     [
         {"job_limit": 0},
         {"checkpoint_identity": " "},
+        {"checkpoint_version": " "},
         {"generation_mode": "streaming"},
         {"generation_chunk_rounds": 256},
         {"generation_mode": "bounded", "generation_chunk_rounds": 0},
@@ -92,7 +96,7 @@ def test_manifest_provenance_round_trips_without_raw_seed_fields() -> None:
         source_commit="1440540b725772582122235ccf845f4f62347ad6",
         execution_backend="KAGGLE",
         generation_law_version="standard_monolithic_v1",
-        checkpoint_identity="causaldem-pilot-checkpoint:7",
+        checkpoint_identity=CHECKPOINT_IDENTITY,
         generation_mode="bounded",
         generation_chunk_rounds=256,
     )
@@ -105,7 +109,7 @@ def test_manifest_provenance_round_trips_without_raw_seed_fields() -> None:
         "source_commit": "1440540b725772582122235ccf845f4f62347ad6",
         "execution_backend": "kaggle",
         "generation_law_version": "standard_monolithic_v1",
-        "checkpoint_identity": "causaldem-pilot-checkpoint:7",
+        "checkpoint_identity": CHECKPOINT_IDENTITY,
         "generation_mode": "bounded",
         "generation_chunk_rounds": 256,
     }
@@ -335,6 +339,7 @@ def _checkpoint_inventory(root: Path) -> tuple[artifact_module.CheckpointPair, .
         root,
         expected_config_hash=CHECKPOINT_CONFIG_HASH,
         expected_provenance=CHECKPOINT_PROVENANCE,
+        expected_checkpoint_version=CHECKPOINT_VERSION,
     )
 
 
@@ -344,6 +349,7 @@ def _checkpoint_export(source: Path, destination: Path) -> Path:
         destination,
         expected_config_hash=CHECKPOINT_CONFIG_HASH,
         expected_provenance=CHECKPOINT_PROVENANCE,
+        expected_checkpoint_version=CHECKPOINT_VERSION,
     )
 
 
@@ -365,6 +371,7 @@ def _write_checkpoint_manifest(
         "dataset_profile": "pilot",
         "resolved_config_hash": CHECKPOINT_CONFIG_HASH,
         "provenance": serialize_manifest_provenance(CHECKPOINT_PROVENANCE),
+        "checkpoint_input_version": CHECKPOINT_VERSION,
         "results": [
             {
                 "condition_id": job.condition_id,
@@ -459,6 +466,7 @@ def test_public_checkpoint_workflow_requires_caller_supplied_identity(
     arguments: dict[str, object] = {
         "expected_config_hash": CHECKPOINT_CONFIG_HASH,
         "expected_provenance": CHECKPOINT_PROVENANCE,
+        "expected_checkpoint_version": CHECKPOINT_VERSION,
     }
     if omission == "both":
         arguments.clear()
@@ -488,16 +496,19 @@ def test_legacy_bootstrap_upgrade_validates_all_44_pairs_before_workflow(
         tmp_path,
         expected_config_hash=LEGACY_CHECKPOINT_CONFIG_HASH,
         expected_provenance=CHECKPOINT_PROVENANCE,
+        expected_checkpoint_version=CHECKPOINT_VERSION,
     )
 
     upgraded = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert upgraded["provenance"] == serialize_manifest_provenance(CHECKPOINT_PROVENANCE)
+    assert upgraded["checkpoint_input_version"] == CHECKPOINT_VERSION
     assert upgraded["sealed_commitment"] == CHECKPOINT_SEALED_COMMITMENT
     assert tuple(verify_artifact(path) for path in artifact_paths) == before_hashes
     inventory = artifact_module.inventory_checkpoint(
         tmp_path,
         expected_config_hash=LEGACY_CHECKPOINT_CONFIG_HASH,
         expected_provenance=CHECKPOINT_PROVENANCE,
+        expected_checkpoint_version=CHECKPOINT_VERSION,
     )
     assert len(inventory) == 44
     export = tmp_path / "export"
@@ -507,6 +518,7 @@ def test_legacy_bootstrap_upgrade_validates_all_44_pairs_before_workflow(
             export,
             expected_config_hash=LEGACY_CHECKPOINT_CONFIG_HASH,
             expected_provenance=CHECKPOINT_PROVENANCE,
+            expected_checkpoint_version=CHECKPOINT_VERSION,
         )
         == export
     )
@@ -535,6 +547,7 @@ def test_legacy_bootstrap_upgrade_refuses_an_arbitrary_checkpoint(
             tmp_path,
             expected_config_hash=LEGACY_CHECKPOINT_CONFIG_HASH,
             expected_provenance=CHECKPOINT_PROVENANCE,
+            expected_checkpoint_version=CHECKPOINT_VERSION,
         )
     assert manifest_path.read_bytes() == original
 
@@ -561,6 +574,7 @@ def test_legacy_bootstrap_upgrade_rejects_invalid_input_without_rewriting_manife
             tmp_path,
             expected_config_hash=expected_config_hash,
             expected_provenance=CHECKPOINT_PROVENANCE,
+            expected_checkpoint_version=CHECKPOINT_VERSION,
         )
     assert manifest_path.read_bytes() == original
 
@@ -643,6 +657,40 @@ def test_checkpoint_inventory_rejects_manifest_identity_mismatches(
             tmp_path,
             expected_config_hash=CHECKPOINT_CONFIG_HASH,
             expected_provenance=CHECKPOINT_PROVENANCE,
+            expected_checkpoint_version=CHECKPOINT_VERSION,
+        )
+
+
+def test_checkpoint_inventory_allows_newer_version_only_for_same_stable_dataset(
+    tmp_path: Path, tiny_job: TrajectoryJob
+) -> None:
+    observable_path, label_path = publish_trajectory(
+        tmp_path, tiny_job, _observable(), _labels(), _checkpoint_metadata()
+    )
+    _write_checkpoint_manifest(tmp_path, tiny_job, observable_path, label_path)
+
+    assert artifact_module.inventory_checkpoint(
+        tmp_path,
+        expected_config_hash=CHECKPOINT_CONFIG_HASH,
+        expected_provenance=CHECKPOINT_PROVENANCE,
+        expected_checkpoint_version=f"{CHECKPOINT_IDENTITY}@8",
+    )
+    with pytest.raises(artifact_module.ArtifactConflict, match="checkpoint.*identity"):
+        artifact_module.inventory_checkpoint(
+            tmp_path,
+            expected_config_hash=CHECKPOINT_CONFIG_HASH,
+            expected_provenance=replace(
+                CHECKPOINT_PROVENANCE,
+                checkpoint_identity="other-owner/other-checkpoint",
+            ),
+            expected_checkpoint_version="other-owner/other-checkpoint@8",
+        )
+    with pytest.raises(artifact_module.ArtifactConflict, match="checkpoint.*version"):
+        artifact_module.inventory_checkpoint(
+            tmp_path,
+            expected_config_hash=CHECKPOINT_CONFIG_HASH,
+            expected_provenance=CHECKPOINT_PROVENANCE,
+            expected_checkpoint_version=f"{CHECKPOINT_IDENTITY}@6",
         )
 
 

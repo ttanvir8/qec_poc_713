@@ -92,7 +92,7 @@ def _assert_default_checkpoint_resolution(tree: ast.Module) -> None:
 
 
 def _assert_external_checkpoint_identity(tree: ast.Module) -> None:
-    resolver = _load_runner_function(tree, "require_checkpoint_identity")
+    resolver = _load_runner_function(tree, "require_checkpoint_dataset_identity")
     for raw in (None, "", "   "):
         try:
             resolver(raw)
@@ -100,9 +100,19 @@ def _assert_external_checkpoint_identity(tree: ast.Module) -> None:
             pass
         else:
             raise AssertionError("checkpoint identity must be supplied externally")
-    identity = "owner/causaldem-pilot-checkpoint@7"
+    identity = "owner/causaldem-pilot-checkpoint"
     if resolver(f"  {identity}  ") != identity:
         raise AssertionError("external checkpoint identity was not preserved")
+    version_resolver = _load_runner_function(tree, "require_checkpoint_version")
+    version = f"{identity}@7"
+    if version_resolver(f" {version} ", identity) != version:
+        raise AssertionError("attached checkpoint version was not preserved separately")
+    try:
+        version_resolver("other-owner/other-checkpoint@7", identity)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("checkpoint version from another dataset was accepted")
 
 
 def _assert_storage_projection_reserves_new_pair_and_export(tree: ast.Module) -> None:
@@ -188,7 +198,9 @@ def _assert_required_runner_structure(runner: str, tree: ast.Module) -> None:
         "git_validation",
         "20 GiB Kaggle working limit",
         "CAUSALDEM_CHECKPOINT_VERSION",
+        "CAUSALDEM_CHECKPOINT_DATASET_SLUG",
         "--checkpoint-identity",
+        "--checkpoint-version",
     )
     _assert_contains(runner, required, source=RUNNER.name)
     forbidden = ("forbidden_names", "commit_from_copy")
@@ -222,7 +234,9 @@ def validate() -> None:
         "UserSecretsClient",
         "COMMIT_SHA.txt",
         "CAUSALDEM_CHECKPOINT_VERSION",
+        "CAUSALDEM_CHECKPOINT_DATASET_SLUG",
         "--checkpoint-identity",
+        "--checkpoint-version",
     )
     _assert_contains(runner, required_runner_terms, source=RUNNER.name)
     _assert_required_runner_structure(runner, tree)
@@ -251,6 +265,8 @@ def validate() -> None:
         "sharded checkpoint",
         "kaggle --version",
         "exact attached checkpoint dataset version",
+        "stable dataset identity",
+        "checkpoint_input_version",
         "2 GiB per new pair",
         "final local verification",
         "Do not paste",

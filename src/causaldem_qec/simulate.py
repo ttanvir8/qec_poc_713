@@ -41,6 +41,7 @@ from causaldem_qec.core import (
     derive_seed,
     deserialize_manifest_provenance,
     expand_jobs,
+    parse_checkpoint_version,
     serialize_manifest_provenance,
 )
 
@@ -1563,6 +1564,7 @@ def _manifest_payload(
     spec: PocSpec,
     *,
     provenance: ManifestProvenance | None = None,
+    checkpoint_input_version: str | None = None,
     sealed_commitment: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     ordered = [results[key] for key in sorted(results)]
@@ -1604,6 +1606,14 @@ def _manifest_payload(
         )
     if provenance is not None:
         payload["provenance"] = serialize_manifest_provenance(provenance)
+    if checkpoint_input_version is not None:
+        if provenance is None or provenance.checkpoint_identity is None:
+            raise ValueError("checkpoint input version requires checkpoint provenance")
+        version, _ = parse_checkpoint_version(
+            provenance.checkpoint_identity,
+            checkpoint_input_version,
+        )
+        payload["checkpoint_input_version"] = version
     if sealed_commitment is not None:
         payload["sealed_commitment"] = dict(sealed_commitment)
     return payload
@@ -1727,7 +1737,11 @@ def _validate_execution_identity(
     provenance: ManifestProvenance | None,
 ) -> None:
     if execution_options.execution_backend == "local":
-        if execution_options.job_limit is not None or execution_options.checkpoint_identity:
+        if (
+            execution_options.job_limit is not None
+            or execution_options.checkpoint_identity
+            or execution_options.checkpoint_version
+        ):
             raise ValueError("bounded execution options require the kaggle backend")
         if provenance is not None:
             raise ValueError("local generation does not accept kaggle provenance")
@@ -1736,8 +1750,16 @@ def _validate_execution_identity(
         raise ValueError("kaggle generation requires the pilot dataset profile")
     if workers != 1:
         raise ValueError("kaggle generation requires exactly one worker")
-    if execution_options.job_limit is None or execution_options.checkpoint_identity is None:
-        raise ValueError("kaggle generation requires a job limit and checkpoint identity")
+    if (
+        execution_options.job_limit is None
+        or execution_options.checkpoint_identity is None
+        or execution_options.checkpoint_version is None
+    ):
+        raise ValueError("kaggle generation requires a job limit, checkpoint identity, and version")
+    parse_checkpoint_version(
+        execution_options.checkpoint_identity,
+        execution_options.checkpoint_version,
+    )
     if execution_options.generation_mode != "standard":
         raise ValueError("bounded scientific generation is not implemented")
     if (
@@ -1858,6 +1880,7 @@ def assert_run_manifest_identity(
     root: Path,
     spec: PocSpec,
     provenance: ManifestProvenance | None = None,
+    checkpoint_version: str | None = None,
     *,
     allow_bound_provenance: bool = False,
 ) -> None:
@@ -1902,6 +1925,13 @@ def assert_run_manifest_identity(
                 or bound_provenance.generation_chunk_rounds is not None
             ):
                 raise ArtifactConflict("run manifest execution identity mismatch")
+            try:
+                parse_checkpoint_version(
+                    bound_provenance.checkpoint_identity,
+                    document.get("checkpoint_input_version"),
+                )
+            except ValueError as error:
+                raise ArtifactConflict("run manifest checkpoint version mismatch") from error
     else:
         try:
             existing_provenance = deserialize_manifest_provenance(encoded_provenance)
@@ -1909,6 +1939,19 @@ def assert_run_manifest_identity(
             raise ArtifactConflict("run manifest execution identity mismatch") from error
         if existing_provenance != provenance:
             raise ArtifactConflict("run manifest execution identity mismatch")
+        try:
+            _, recorded_version_number = parse_checkpoint_version(
+                provenance.checkpoint_identity,
+                document.get("checkpoint_input_version"),
+            )
+            _, attached_version_number = parse_checkpoint_version(
+                provenance.checkpoint_identity,
+                checkpoint_version,
+            )
+        except ValueError as error:
+            raise ArtifactConflict("run manifest checkpoint version mismatch") from error
+        if recorded_version_number > attached_version_number:
+            raise ArtifactConflict("run manifest checkpoint version is newer than attached input")
 
 
 def generate_matrix(
@@ -1925,7 +1968,12 @@ def generate_matrix(
         raise ValueError("workers must be positive")
     options = execution_options or ExecutionOptions()
     _validate_execution_identity(spec, workers, options, provenance)
-    assert_run_manifest_identity(root, spec, provenance)
+    assert_run_manifest_identity(
+        root,
+        spec,
+        provenance,
+        checkpoint_version=options.checkpoint_version,
+    )
     manifest_path = root / "run_manifest.json"
     config_hash = _resolved_config_hash(spec)
     sealed_commitment = _manifest_sealed_commitment(spec, root, provenance)
@@ -1979,6 +2027,7 @@ def generate_matrix(
                     results,
                     spec,
                     provenance=provenance,
+                    checkpoint_input_version=options.checkpoint_version,
                     sealed_commitment=sealed_commitment,
                 ),
             )
@@ -1996,6 +2045,7 @@ def generate_matrix(
                         results,
                         spec,
                         provenance=provenance,
+                        checkpoint_input_version=options.checkpoint_version,
                         sealed_commitment=sealed_commitment,
                     ),
                 )
@@ -2005,6 +2055,7 @@ def generate_matrix(
             results,
             spec,
             provenance=provenance,
+            checkpoint_input_version=options.checkpoint_version,
             sealed_commitment=sealed_commitment,
         ),
     )
@@ -2032,11 +2083,14 @@ def generate_bounded_checkpoint(
         provenance=provenance,
     )
     if manifest.generated:
+        if execution_options.checkpoint_version is None:
+            raise ValueError("kaggle checkpoint version is required")
         export_checkpoint(
             root,
             checkpoint_root,
             expected_config_hash=_resolved_config_hash(spec),
             expected_provenance=provenance,
+            expected_checkpoint_version=execution_options.checkpoint_version,
         )
     return manifest
 

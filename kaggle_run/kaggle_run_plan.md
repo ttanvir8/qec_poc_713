@@ -47,7 +47,8 @@ standard path unchanged and opt in explicitly:
 --execution-backend kaggle
 --job-limit 1
 --checkpoint-root /kaggle/working/checkpoint
---checkpoint-identity owner/checkpoint-dataset@exact-version
+--checkpoint-identity owner/checkpoint-dataset
+--checkpoint-version owner/checkpoint-dataset@exact-version
 ```
 
 The implementation should:
@@ -132,12 +133,16 @@ Upload two private Kaggle Datasets:
 2. `causaldem-pilot-checkpoint-00`: the verified current `runs/pilot` root with
    44 complete pairs and its manifest.
 
-Record the source commit SHA and immutable checkpoint dataset version in the
-notebook metadata and in the checkpoint manifest. Set
-`CAUSALDEM_CHECKPOINT_VERSION` to the exact pinned input version in
-`owner/dataset@number` form (or to a verified `sha256:<digest>` identity) and
-pass it as `--checkpoint-identity`. Do not use a staging path or mutable latest
-pointer, and do not regenerate the 44 pairs.
+Record the source commit SHA, stable checkpoint dataset identity, and immutable
+attached checkpoint version in the notebook metadata and checkpoint manifest.
+Set `CAUSALDEM_CHECKPOINT_DATASET_SLUG` to the stable `owner/dataset` slug and
+pass it as `--checkpoint-identity`. Set `CAUSALDEM_CHECKPOINT_VERSION` to the
+exact pinned input in `owner/dataset@number` form and pass it as
+`--checkpoint-version`; the manifest records it separately as
+`checkpoint_input_version`. Later numbered versions of the same dataset are
+resume-compatible, while another dataset slug and version rollback are rejected.
+Do not use a staging path or mutable latest pointer, and do not regenerate the
+44 pairs.
 
 ## Kaggle notebook setup
 
@@ -287,7 +292,8 @@ Implement this as a separately reviewed additive change in the existing public
 worktree:
 
 1. In `core.py`, add an immutable execution-options value containing backend,
-   job limit, checkpoint identity, and optional bounded-generation settings.
+   job limit, stable checkpoint identity, attached checkpoint version, and
+   optional bounded-generation settings.
 2. In `cli.py`, add `--execution-backend`, `--job-limit`, and
    `--checkpoint-root`; reject invalid combinations before workers start.
 3. In `simulate.py`, add deterministic next-job selection and a one-job

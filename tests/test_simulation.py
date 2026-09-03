@@ -507,13 +507,14 @@ def _kaggle_execution() -> tuple[ExecutionOptions, ManifestProvenance]:
     options = ExecutionOptions(
         execution_backend="kaggle",
         job_limit=1,
-        checkpoint_identity="pilot-checkpoint:test",
+        checkpoint_identity="owner/causaldem-pilot-checkpoint",
+        checkpoint_version="owner/causaldem-pilot-checkpoint@7",
     )
     provenance = ManifestProvenance(
         source_commit="task-3-test",
         execution_backend="kaggle",
         generation_law_version="standard_monolithic_v1",
-        checkpoint_identity="pilot-checkpoint:test",
+        checkpoint_identity="owner/causaldem-pilot-checkpoint",
     )
     return options, provenance
 
@@ -667,10 +668,11 @@ def test_kaggle_manifest_binds_execution_identity_without_raw_seed(
         "source_commit": "task-3-test",
         "execution_backend": "kaggle",
         "generation_law_version": "standard_monolithic_v1",
-        "checkpoint_identity": "pilot-checkpoint:test",
+        "checkpoint_identity": "owner/causaldem-pilot-checkpoint",
         "generation_mode": "standard",
         "generation_chunk_rounds": None,
     }
+    assert manifest["checkpoint_input_version"] == "owner/causaldem-pilot-checkpoint@7"
     assert "root_seed" not in json.dumps(manifest)
 
 
@@ -730,17 +732,26 @@ def test_sealed_checkpoint_export_resumes_with_public_commitment_only(tmp_path: 
     resumed_commitment = resumed_run / "data" / "manifests" / "sealed_commitment.json"
     assert load_sealed_seed(private, resumed_commitment, purpose="sealed_evaluation") == 99887766
     second_export = tmp_path / "checkpoint-2"
+    next_version_options = replace(
+        options,
+        checkpoint_version="owner/causaldem-pilot-checkpoint@8",
+    )
     resumed = generate_bounded_checkpoint(
         spec,
         (sealed_job, nonsealed_job),
         resumed_run,
         second_export,
         workers=1,
-        execution_options=options,
+        execution_options=next_version_options,
         provenance=provenance,
     )
 
     assert resumed.completed == 2
+    resumed_manifest = json.loads((resumed_run / "run_manifest.json").read_text(encoding="utf-8"))
+    assert resumed_manifest["provenance"]["checkpoint_identity"] == (
+        "owner/causaldem-pilot-checkpoint"
+    )
+    assert resumed_manifest["checkpoint_input_version"] == ("owner/causaldem-pilot-checkpoint@8")
     assert (second_export / "data" / "manifests" / "sealed_commitment.json").is_file()
     assert not any(path.name == private.name for path in second_export.rglob("*"))
 
@@ -748,7 +759,12 @@ def test_sealed_checkpoint_export_resumes_with_public_commitment_only(tmp_path: 
 def test_kaggle_resume_rejects_private_seed_manifest_before_generation(tmp_path: Path) -> None:
     spec = _tiny_pilot_spec()
     options, provenance = _kaggle_execution()
-    manifest = _manifest_payload({}, spec, provenance=provenance)
+    manifest = _manifest_payload(
+        {},
+        spec,
+        provenance=provenance,
+        checkpoint_input_version=options.checkpoint_version,
+    )
     manifest["sealed_manifest"] = {"root_seed": 99887766}
     manifest_path = tmp_path / "run_manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")

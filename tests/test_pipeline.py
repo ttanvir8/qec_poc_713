@@ -211,10 +211,18 @@ def test_eda_identity_preflight_accepts_a_valid_provenance_bound_kaggle_manifest
         source_commit="task-3-review",
         execution_backend="kaggle",
         generation_law_version="standard_monolithic_v1",
-        checkpoint_identity="pilot-checkpoint:review",
+        checkpoint_identity="owner/causaldem-pilot-checkpoint",
     )
     (tmp_path / "run_manifest.json").write_text(
-        json.dumps(_manifest_payload({}, spec, provenance=provenance)), encoding="utf-8"
+        json.dumps(
+            _manifest_payload(
+                {},
+                spec,
+                provenance=provenance,
+                checkpoint_input_version="owner/causaldem-pilot-checkpoint@7",
+            )
+        ),
+        encoding="utf-8",
     )
 
     assert_run_manifest_identity(
@@ -307,6 +315,8 @@ def test_kaggle_pilot_dry_run_accepts_explicit_bounded_checkpoint_flags(
                 "--checkpoint-root",
                 str(tmp_path / "checkpoint"),
                 "--checkpoint-identity",
+                "owner/causaldem-pilot-checkpoint",
+                "--checkpoint-version",
                 "owner/causaldem-pilot-checkpoint@7",
                 "--dry-run",
             ]
@@ -317,7 +327,8 @@ def test_kaggle_pilot_dry_run_accepts_explicit_bounded_checkpoint_flags(
     assert status["execution_backend"] == "kaggle"
     assert status["job_limit"] == 1
     assert status["checkpoint_root"] == str((tmp_path / "checkpoint").resolve())
-    assert status["checkpoint_identity"] == "owner/causaldem-pilot-checkpoint@7"
+    assert status["checkpoint_identity"] == "owner/causaldem-pilot-checkpoint"
+    assert status["checkpoint_input_version"] == "owner/causaldem-pilot-checkpoint@7"
     assert not (tmp_path / "run").exists()
     assert not (tmp_path / "checkpoint").exists()
 
@@ -343,6 +354,31 @@ def test_kaggle_cli_requires_external_checkpoint_identity(tmp_path: Path) -> Non
     assert not (tmp_path / "run").exists()
 
 
+def test_kaggle_cli_rejects_checkpoint_version_from_another_dataset(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="checkpoint version.*identity"):
+        main(
+            [
+                "generate-pilot",
+                "--config",
+                "configs/poc_pilot.json",
+                "--output-root",
+                str(tmp_path / "run"),
+                "--execution-backend",
+                "kaggle",
+                "--job-limit",
+                "1",
+                "--checkpoint-root",
+                str(tmp_path / "checkpoint"),
+                "--checkpoint-identity",
+                "owner/causaldem-pilot-checkpoint",
+                "--checkpoint-version",
+                "other-owner/other-checkpoint@7",
+                "--dry-run",
+            ]
+        )
+    assert not (tmp_path / "run").exists()
+
+
 def test_kaggle_cli_rejects_checkpoint_overlap_with_private_manifest(tmp_path: Path) -> None:
     private = tmp_path / "checkpoint" / "sealed.json"
     with pytest.raises(ValueError, match="private sealed manifest"):
@@ -360,6 +396,8 @@ def test_kaggle_cli_rejects_checkpoint_overlap_with_private_manifest(tmp_path: P
                 "--checkpoint-root",
                 str(tmp_path / "checkpoint"),
                 "--checkpoint-identity",
+                "owner/causaldem-pilot-checkpoint",
+                "--checkpoint-version",
                 "owner/causaldem-pilot-checkpoint@7",
                 "--sealed-manifest",
                 str(private),
