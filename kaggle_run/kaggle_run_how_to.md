@@ -210,6 +210,20 @@ into notebook source, notebook output, a committed file, a public Kaggle
 Dataset, or a shared checkpoint dataset. The checkpoint may contain only the
 sealed commitment hash recorded by the current artifact APIs.
 
+For Dataset publishing, load the attached API credentials after dependency
+installation instead of putting credential values in notebook cells:
+
+```python
+from causaldem_qec.kaggle_auth import configure_kaggle_credentials
+
+configure_kaggle_credentials()
+```
+
+The function reads the `KAGGLE_USERNAME` and `KAGGLE_KEY` Secret labels through
+Kaggle's Notebook Secrets service and sets the environment expected by the
+Kaggle CLI. The labels still need to be attached to the notebook once in the
+Kaggle UI; their values never belong in this repository.
+
 Set `CAUSALDEM_USE_SEALED_MANIFEST=1` only for sessions expected to schedule
 sealed jobs. Leave it unset for normal and development jobs.
 

@@ -495,13 +495,9 @@ def ensure_kaggle_cli() -> str:
 
 
 def configure_kaggle_credentials() -> None:
-    from kaggle_secrets import UserSecretsClient
+    from causaldem_qec.kaggle_auth import configure_kaggle_credentials as load_credentials
 
-    client = UserSecretsClient()
-    os.environ["KAGGLE_USERNAME"] = client.get_secret("KAGGLE_USERNAME")
-    os.environ["KAGGLE_KEY"] = client.get_secret("KAGGLE_KEY")
-    if not os.environ["KAGGLE_USERNAME"] or not os.environ["KAGGLE_KEY"]:
-        raise RuntimeError("Kaggle API credentials are missing")
+    load_credentials()
 
 
 def write_dataset_metadata() -> tuple[str, str]:
