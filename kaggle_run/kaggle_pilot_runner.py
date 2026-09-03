@@ -19,16 +19,16 @@ from pathlib import Path
 # %% [markdown]
 # # CausalDEM-QEC Kaggle Pilot Runner
 #
-# Attach these private Kaggle Datasets before running:
-#
-# - `causaldem-poc-source`, containing the public source tree and COMMIT_SHA.txt.
-# - The newest private pilot checkpoint dataset, containing `pilot/run_manifest.json`.
+# Attach the newest private pilot checkpoint dataset before running. The public
+# source repository is cloned below, so no source Dataset attachment is needed.
 #
 # Keep Internet on only while installing dependencies and publishing the private
 # checkpoint dataset version.
 
 # %%
-SOURCE_INPUT = Path("/kaggle/input/causaldem-poc-source")
+DEFAULT_REPO_URL = "https://github.com/ttanvir8/qec_poc_713.git"
+REPO_URL = os.environ.get("CAUSALDEM_REPO_URL", DEFAULT_REPO_URL)
+REPO_REF = os.environ.get("CAUSALDEM_REPO_REF", "main")
 DEFAULT_CHECKPOINT_INPUT = Path("/kaggle/input/causaldem-pilot-checkpoint-00")
 
 
@@ -202,58 +202,37 @@ assert_runtime_budget(started_at)
 run([sys.executable, "-m", "pip", "install", "-q", "uv"])
 
 
-def locate_source_root(source_input: Path) -> Path:
-    candidates = [source_input, *[path for path in source_input.iterdir() if path.is_dir()]]
-    for candidate in candidates:
-        if (candidate / "pyproject.toml").is_file() and (candidate / "uv.lock").is_file():
-            return candidate
-    raise RuntimeError("source dataset must contain pyproject.toml and uv.lock")
+def clone_command(repo_url: str, repo_ref: str, destination: Path) -> list[str]:
+    return [
+        "git",
+        "clone",
+        "--branch",
+        repo_ref,
+        "--single-branch",
+        repo_url,
+        str(destination),
+    ]
 
 
-def read_source_commit_marker(source_root: Path) -> str:
-    marker = source_root / "COMMIT_SHA.txt"
-    if not marker.is_file():
-        raise RuntimeError("source dataset must contain COMMIT_SHA.txt")
-    source_commit = marker.read_text(encoding="utf-8").strip()
-    if not re.fullmatch(r"[0-9a-f]{7,40}", source_commit):
-        raise RuntimeError("COMMIT_SHA.txt must contain a Git commit SHA")
-    return source_commit
-
-
-def validate_source_commit(source_root: Path) -> tuple[str, str]:
-    source_commit = read_source_commit_marker(source_root)
-    if not (source_root / ".git").exists():
-        return source_commit, "not_available_input_dataset_has_no_git"
-    git_commit = run(["git", "rev-parse", "HEAD"], cwd=source_root).strip()
-    if git_commit != source_commit:
-        raise RuntimeError("source commit does not match COMMIT_SHA.txt")
-    return source_commit, "matched_git_head"
-
-
-def copy_source() -> Path:
-    source_root = locate_source_root(SOURCE_INPUT)
-    source_commit, git_validation = validate_source_commit(source_root)
+def clone_source() -> Path:
     if WORKING_SOURCE.exists():
         raise RuntimeError(f"{WORKING_SOURCE} already exists; inspect before reuse")
-    shutil.copytree(
-        source_root,
-        WORKING_SOURCE,
-        ignore=shutil.ignore_patterns(
-            ".superpowers",
-            ".worktrees",
-            "runs",
-            "reports",
-            "data",
-            "__pycache__",
-            ".pytest_cache",
-            ".ruff_cache",
-        ),
+    run(clone_command(REPO_URL, REPO_REF, WORKING_SOURCE))
+    source_commit = run(["git", "rev-parse", "HEAD"], cwd=WORKING_SOURCE).strip()
+    print(
+        json.dumps(
+            {
+                "source_repo": REPO_URL,
+                "source_ref": REPO_REF,
+                "source_commit": source_commit,
+                "git_validation": "matched_git_head",
+            }
+        )
     )
-    print(json.dumps({"source_commit": source_commit, "git_validation": git_validation}))
     return WORKING_SOURCE
 
 
-REPO = copy_source()
+REPO = clone_source()
 
 # %%
 # Keep this exact command text for notebook review: uv sync --frozen --extra dev

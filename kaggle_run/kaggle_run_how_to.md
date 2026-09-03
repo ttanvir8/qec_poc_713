@@ -9,27 +9,13 @@ checkpoint export on persistent storage. Do not paste actual secrets or raw seed
 values into the notebook, this guide, Git, notebook metadata, or any Kaggle
 Dataset output.
 
-## 1. Prepare private local inputs
+## 1. Prepare the private checkpoint input
 
-1. Work from the public implementation checkout on `main`, not the private
-   planning checkout.
-2. Confirm the public source commit:
-
-   ```bash
-   git -C /mnt/d/win-fun/quantum/poc_713/.worktrees/public-main rev-parse HEAD
-   git -C /mnt/d/win-fun/quantum/poc_713/.worktrees/public-main status --short
-   ```
-
-3. Create a source upload directory that contains only publishable source files.
-   Include `pyproject.toml`, `uv.lock`, `configs/`, `src/`, `tests/`,
-   `kaggle_run/`, and a `COMMIT_SHA.txt` file containing the exact public
-   source commit.
-4. Exclude `.superpowers/`, the primary checkout, `.worktrees/`, private
-   planning documents, sealed manifests, generated `runs/`, generated `data/`,
-   generated `reports/`, shell history, and notebook outputs.
-5. Upload that directory as a private source dataset named
-   `causaldem-poc-source`.
-6. Upload the verified current pilot checkpoint as a private checkpoint dataset,
+1. The notebook clones the public implementation directly from GitHub. It
+   defaults to `https://github.com/ttanvir8/qec_poc_713.git` on the `main`
+   branch. Set `CAUSALDEM_REPO_URL` and `CAUSALDEM_REPO_REF` before running if a
+   different public repository or ref is required.
+2. Upload the verified current pilot checkpoint as a private checkpoint dataset,
    for example `causaldem-pilot-checkpoint-00`. Its root should contain
    `pilot/run_manifest.json` and the matching observable and label artifact
    lanes. Do not regenerate the existing 44-pair checkpoint.
@@ -38,8 +24,7 @@ Dataset output.
 
 1. Create a new private Notebook.
 2. Select the Kaggle free CPU runtime. Do not select a GPU.
-3. Attach the private source dataset `causaldem-poc-source`.
-4. Attach the newest private checkpoint dataset, initially the 44-pair
+3. Attach the newest private checkpoint dataset, initially the 44-pair
    checkpoint dataset. Pin the attachment to an exact numbered Dataset version;
    do not attach a mutable latest version.
 5. Enable Internet only while installing dependencies or publishing a checkpoint
@@ -68,9 +53,9 @@ Dataset output.
 
 ## 3. Run the notebook asset
 
-1. Open `kaggle_run/kaggle_pilot_runner.py` from the private source dataset.
-2. Paste it into the Kaggle notebook as cells, or run it as a script from the
-   copied source directory.
+1. Open `kaggle_run/kaggle_pilot_runner.py` from this repository.
+2. Paste it into the Kaggle notebook as cells, or run it as a script after
+   cloning the repository.
 3. The first cells verify the runtime and print Python, platform, disk, RAM, and
    elapsed-time checks. Stop if Python is not 3.11, if working storage is near
    18 GiB used, if less than 2 GiB is free, if the checkpoint cannot fit within
@@ -83,11 +68,8 @@ Dataset output.
    ```
 
    Do not regenerate `uv.lock` in Kaggle.
-5. The source commit check compares the attached private source dataset's
-   `COMMIT_SHA.txt`, and, when `.git` is present in the input dataset, to
-   `git rev-parse HEAD`. If `.git` is absent, the runner records that Git
-   validation was unavailable instead of comparing the marker to its own copied
-   copy.
+5. The source commit check records the exact commit resolved by
+   `git rev-parse HEAD` after cloning.
 6. The checkpoint copy step copies the private checkpoint dataset into
    `/kaggle/working/runs/pilot`. The notebook never writes into
    `/kaggle/input`.
