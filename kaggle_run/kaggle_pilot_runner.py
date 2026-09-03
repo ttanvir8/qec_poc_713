@@ -508,7 +508,6 @@ def publish_private_checkpoint() -> None:
                 "create",
                 "-p",
                 str(EXPORT_ROOT),
-                "--private",
                 "--dir-mode",
                 "zip",
             ]

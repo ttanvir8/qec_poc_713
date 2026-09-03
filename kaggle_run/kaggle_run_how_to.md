@@ -164,7 +164,7 @@ checkpoint.
 The first successful export creates the private checkpoint dataset:
 
 ```bash
-kaggle datasets create -p /kaggle/working/export --private --dir-mode zip
+kaggle datasets create -p /kaggle/working/export --dir-mode zip
 ```
 
 Every subsequent export versions the same private Kaggle Dataset:
