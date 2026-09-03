@@ -40,7 +40,8 @@ Dataset output.
 2. Select the Kaggle free CPU runtime. Do not select a GPU.
 3. Attach the private source dataset `causaldem-poc-source`.
 4. Attach the newest private checkpoint dataset, initially the 44-pair
-   checkpoint dataset.
+   checkpoint dataset. Pin the attachment to an exact numbered Dataset version;
+   do not attach a mutable latest version.
 5. Enable Internet only while installing dependencies or publishing a checkpoint
    dataset version.
 6. Add Kaggle Secrets named `KAGGLE_USERNAME` and `KAGGLE_KEY` for the Kaggle
@@ -52,11 +53,16 @@ Dataset output.
    import os
 
    os.environ["CAUSALDEM_CHECKPOINT_DATASET_SLUG"] = "your-kaggle-name/causaldem-pilot-checkpoint"
+   os.environ["CAUSALDEM_CHECKPOINT_VERSION"] = "your-kaggle-name/causaldem-pilot-checkpoint@7"
    os.environ["CAUSALDEM_CREATE_CHECKPOINT_DATASET"] = "1"  # first upload only
    ```
 
    For later versions, remove `CAUSALDEM_CREATE_CHECKPOINT_DATASET` or set it to
-   `0`.
+   `0`. Set `CAUSALDEM_CHECKPOINT_VERSION` from the exact attached checkpoint dataset version
+   shown for the pinned input. A verified
+   `sha256:<64 lowercase hex>`
+   checkpoint content digest is also accepted. The runner refuses to start when
+   this immutable external identity is absent or malformed.
 
 ## 3. Run the notebook asset
 
@@ -130,7 +136,8 @@ uv run causaldem-poc generate-pilot \
   --workers 1 \
   --execution-backend kaggle \
   --job-limit 1 \
-  --checkpoint-root /kaggle/working/export/pilot
+  --checkpoint-root /kaggle/working/export/pilot \
+  --checkpoint-identity your-kaggle-name/causaldem-pilot-checkpoint@7
 ```
 
 For sealed jobs, the runner adds:
@@ -149,11 +156,13 @@ After a successful job, the CLI exports a checkpoint to
 `/kaggle/working/export/pilot`. The export is uploadable only if it contains the
 manifest and verified artifact files. The runner validates the checkpoint
 payload with an exact allowlist: `pilot/run_manifest.json` plus
-`arrays.npz`, `metadata.json`, and `SHA256SUMS` files under the observable and
-label artifact lanes. Source code, secrets, staging directories, logs containing
-sensitive values, `.superpowers/`, `.worktrees/`, notebook outputs, scratch
-files, symlinks, and any other path are rejected because they are not on that
-allowlist.
+`pilot/data/manifests/sealed_commitment.json` when manifest-bound, plus
+`arrays.npz`, `metadata.json`, and `SHA256SUMS` files under
+`pilot/data/{observable|labels}/...`. The public commitment is required for
+sealed resume validation; the private sealed manifest is never exported. Source
+code, secrets, staging directories, logs containing sensitive values,
+`.superpowers/`, `.worktrees/`, notebook outputs, scratch files, symlinks, and
+any other path are rejected because they are not on that allowlist.
 
 The runner checks the export root before upload. If generation completed but no
 export exists, stop and inspect the CLI output; do not publish a partial
@@ -191,6 +200,10 @@ Use these thresholds on Kaggle free CPU:
 
 - Stop after the current complete job if `/kaggle/working` approaches 18 GiB
   used.
+- Before copying, reserve 2 GiB per new pair in both the writable working root
+  and its full export copy. The projection includes existing `/kaggle/working`
+  usage, the attached checkpoint copy, the new pair, and the next export; shard
+  the checkpoint when that projection exceeds the 18 GiB safe ceiling.
 - Stop if less than 2 GiB of `/kaggle/working` is free.
 - Stop before the 12-hour limit; leave at least 45 minutes for verification and
   upload.

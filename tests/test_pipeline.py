@@ -306,6 +306,8 @@ def test_kaggle_pilot_dry_run_accepts_explicit_bounded_checkpoint_flags(
                 "1",
                 "--checkpoint-root",
                 str(tmp_path / "checkpoint"),
+                "--checkpoint-identity",
+                "owner/causaldem-pilot-checkpoint@7",
                 "--dry-run",
             ]
         )
@@ -315,8 +317,30 @@ def test_kaggle_pilot_dry_run_accepts_explicit_bounded_checkpoint_flags(
     assert status["execution_backend"] == "kaggle"
     assert status["job_limit"] == 1
     assert status["checkpoint_root"] == str((tmp_path / "checkpoint").resolve())
+    assert status["checkpoint_identity"] == "owner/causaldem-pilot-checkpoint@7"
     assert not (tmp_path / "run").exists()
     assert not (tmp_path / "checkpoint").exists()
+
+
+def test_kaggle_cli_requires_external_checkpoint_identity(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="checkpoint identity"):
+        main(
+            [
+                "generate-pilot",
+                "--config",
+                "configs/poc_pilot.json",
+                "--output-root",
+                str(tmp_path / "run"),
+                "--execution-backend",
+                "kaggle",
+                "--job-limit",
+                "1",
+                "--checkpoint-root",
+                str(tmp_path / "checkpoint"),
+                "--dry-run",
+            ]
+        )
+    assert not (tmp_path / "run").exists()
 
 
 def test_kaggle_cli_rejects_checkpoint_overlap_with_private_manifest(tmp_path: Path) -> None:
@@ -335,6 +359,8 @@ def test_kaggle_cli_rejects_checkpoint_overlap_with_private_manifest(tmp_path: P
                 "1",
                 "--checkpoint-root",
                 str(tmp_path / "checkpoint"),
+                "--checkpoint-identity",
+                "owner/causaldem-pilot-checkpoint@7",
                 "--sealed-manifest",
                 str(private),
                 "--dry-run",

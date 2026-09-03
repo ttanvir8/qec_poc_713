@@ -787,13 +787,17 @@ def _inventory_checkpoint(
     if has_sealed_pairs and not _is_sha256_commitment(sealed_commitment):
         raise ArtifactConflict("checkpoint sealed commitment is required")
     commitment_path = root / "data" / "manifests" / "sealed_commitment.json"
-    if commitment_path.exists():
+    if sealed_commitment is not None:
+        if commitment_path.is_symlink() or not commitment_path.is_file():
+            raise ArtifactConflict("checkpoint sealed commitment artifact is required")
         try:
             source_commitment = json.loads(commitment_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise ArtifactConflict("checkpoint sealed commitment is invalid") from error
         if source_commitment != sealed_commitment:
             raise ArtifactConflict("checkpoint sealed commitment mismatch")
+    elif commitment_path.is_symlink() or commitment_path.exists():
+        raise ArtifactConflict("checkpoint sealed commitment is not manifest-bound")
     return tuple(inventory)
 
 
@@ -946,10 +950,15 @@ def upgrade_legacy_kaggle_bootstrap(
 
 
 _CHECKPOINT_ARTIFACT_FILES = ("arrays.npz", "metadata.json", "SHA256SUMS")
+_SEALED_COMMITMENT_RELATIVE_PATH = Path("data", "manifests", "sealed_commitment.json")
 
 
-def _checkpoint_file_set(inventory: Sequence[CheckpointPair]) -> set[Path]:
+def _checkpoint_file_set(
+    inventory: Sequence[CheckpointPair], *, include_sealed_commitment: bool
+) -> set[Path]:
     files = {Path("run_manifest.json")}
+    if include_sealed_commitment:
+        files.add(_SEALED_COMMITMENT_RELATIVE_PATH)
     for pair in inventory:
         for directory in (pair.relative_path, pair.label_relative_path):
             files.update(directory / name for name in _CHECKPOINT_ARTIFACT_FILES)
@@ -991,7 +1000,10 @@ def _checkpoint_export_matches(
         ):
             return False
         actual_files = {path.relative_to(destination) for path in entries if path.is_file()}
-        return actual_files == _checkpoint_file_set(inventory)
+        return actual_files == _checkpoint_file_set(
+            inventory,
+            include_sealed_commitment=(source / _SEALED_COMMITMENT_RELATIVE_PATH).is_file(),
+        )
     except (OSError, TypeError, ValueError):
         return False
 
@@ -1075,6 +1087,12 @@ def export_checkpoint(
     staging = _staging_directory(destination)
     try:
         _copy_checkpoint_file(source / "run_manifest.json", staging / "run_manifest.json")
+        commitment_path = source / _SEALED_COMMITMENT_RELATIVE_PATH
+        if commitment_path.is_file():
+            _copy_checkpoint_file(
+                commitment_path,
+                staging / _SEALED_COMMITMENT_RELATIVE_PATH,
+            )
         for pair in inventory:
             for relative in (pair.relative_path, pair.label_relative_path):
                 for name in _CHECKPOINT_ARTIFACT_FILES:

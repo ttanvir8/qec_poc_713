@@ -646,7 +646,9 @@ def test_checkpoint_inventory_rejects_manifest_identity_mismatches(
         )
 
 
-@pytest.mark.parametrize("failure", ["missing_manifest_commitment", "source_mismatch"])
+@pytest.mark.parametrize(
+    "failure", ["missing_manifest_commitment", "missing_commitment_artifact", "source_mismatch"]
+)
 def test_checkpoint_inventory_rejects_invalid_sealed_commitment_constraints(
     tmp_path: Path, tiny_job: TrajectoryJob, failure: str
 ) -> None:
@@ -663,6 +665,8 @@ def test_checkpoint_inventory_rejects_invalid_sealed_commitment_constraints(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         del manifest["sealed_commitment"]
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    elif failure == "missing_commitment_artifact":
+        commitment_path.unlink()
     else:
         commitment_path.write_text(
             json.dumps({"algorithm": "sha256", "digest": "c" * 64}), encoding="utf-8"
@@ -770,6 +774,34 @@ def test_export_checkpoint_preserves_manifest_and_copies_only_verified_files(
             for name in ("arrays.npz", "metadata.json", "SHA256SUMS")
         },
     }
+
+
+def test_export_checkpoint_carries_only_public_sealed_commitment_for_resume(
+    tmp_path: Path, tiny_job: TrajectoryJob
+) -> None:
+    source = tmp_path / "source"
+    export = tmp_path / "export"
+    private = tmp_path / "private" / "sealed.json"
+    private.parent.mkdir()
+    private.write_text('{"root_seed":99887766}', encoding="utf-8")
+    sealed_job = replace(tiny_job, split="sealed_test")
+    observable_path, label_path = publish_trajectory(
+        source, sealed_job, _observable(), _labels(), _checkpoint_metadata()
+    )
+    _write_checkpoint_manifest(source, sealed_job, observable_path, label_path)
+    commitment_path = source / "data" / "manifests" / "sealed_commitment.json"
+    digest = write_sealed_commitment(private, commitment_path)
+    manifest_path = source / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sealed_commitment"] = {"algorithm": "sha256", "digest": digest}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    _checkpoint_export(source, export)
+
+    exported_commitment = export / "data" / "manifests" / "sealed_commitment.json"
+    assert exported_commitment.read_bytes() == commitment_path.read_bytes()
+    assert load_sealed_seed(private, exported_commitment, purpose="sealed_evaluation") == 99887766
+    assert not any(path.name == private.name for path in export.rglob("*"))
 
 
 def test_export_checkpoint_never_overwrites_a_conflicting_destination(

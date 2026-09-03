@@ -55,6 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--execution-backend", choices=("local", "kaggle"), default="local")
     parser.add_argument("--job-limit", type=int)
     parser.add_argument("--checkpoint-root", type=Path)
+    parser.add_argument("--checkpoint-identity")
     parser.add_argument("--sealed-manifest", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--reports-root", type=Path, default=Path("reports/dataset_eda"))
@@ -192,20 +193,30 @@ def _execution_context(
     options = ExecutionOptions(
         execution_backend=args.execution_backend,
         job_limit=args.job_limit,
-        checkpoint_identity=(
-            f"checkpoint-root:{args.checkpoint_root.resolve()}"
-            if args.checkpoint_root is not None
-            else None
-        ),
+        checkpoint_identity=args.checkpoint_identity,
     )
     if options.execution_backend == "local":
-        if args.job_limit is not None or args.checkpoint_root is not None:
-            raise ValueError("--job-limit and --checkpoint-root require --execution-backend kaggle")
+        if (
+            args.job_limit is not None
+            or args.checkpoint_root is not None
+            or args.checkpoint_identity is not None
+        ):
+            raise ValueError(
+                "--job-limit, --checkpoint-root, and --checkpoint-identity require "
+                "--execution-backend kaggle"
+            )
         return options, None
     if args.stage != "generate-pilot" or spec.dataset_profile != "pilot":
         raise ValueError("kaggle execution is supported only for generate-pilot")
-    if options.job_limit is None or args.checkpoint_root is None:
-        raise ValueError("kaggle execution requires --job-limit and --checkpoint-root")
+    if (
+        options.job_limit is None
+        or args.checkpoint_root is None
+        or options.checkpoint_identity is None
+    ):
+        raise ValueError(
+            "kaggle execution requires --job-limit, --checkpoint-root, and an externally "
+            "supplied checkpoint identity via --checkpoint-identity"
+        )
     if args.workers != 1:
         raise ValueError("kaggle execution requires --workers 1")
     if _path_contains(args.output_root, args.checkpoint_root) or _path_contains(
@@ -276,6 +287,7 @@ def _pilot_status(
                 "checkpoint_root": None
                 if checkpoint_root is None
                 else str(checkpoint_root.resolve()),
+                "checkpoint_identity": execution_options.checkpoint_identity,
             }
         )
     return status

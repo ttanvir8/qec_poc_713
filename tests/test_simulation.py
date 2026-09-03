@@ -1,4 +1,5 @@
 import json
+import shutil
 from collections import Counter
 from dataclasses import replace
 from itertools import pairwise
@@ -8,6 +9,7 @@ import numpy as np
 import pytest
 import stim
 
+from causaldem_qec.artifacts import load_sealed_seed, write_sealed_commitment
 from causaldem_qec.cli import main
 from causaldem_qec.core import (
     CircuitSpec,
@@ -694,6 +696,53 @@ def test_bounded_generation_exports_only_after_a_verified_pair(tmp_path: Path) -
     ).read_bytes()
     assert len(tuple(checkpoint_root.glob("data/observable/*/*/*"))) == 1
     assert len(tuple(checkpoint_root.glob("data/labels/*/*/*"))) == 1
+
+
+def test_sealed_checkpoint_export_resumes_with_public_commitment_only(tmp_path: Path) -> None:
+    spec = _tiny_pilot_spec()
+    options, provenance = _kaggle_execution()
+    private = tmp_path / "private" / "sealed.json"
+    private.parent.mkdir()
+    private.write_text('{"root_seed":99887766}', encoding="utf-8")
+    first_run = tmp_path / "first-run"
+    commitment = first_run / "data" / "manifests" / "sealed_commitment.json"
+    write_sealed_commitment(private, commitment)
+    all_jobs = expand_jobs(spec, include_sealed=True)
+    sealed_job = replace(
+        next(job for job in all_jobs if job.split == "sealed_test"),
+        root_seed=99887766,
+    )
+    nonsealed_job = next(job for job in all_jobs if job.split != "sealed_test")
+    first_export = tmp_path / "checkpoint-1"
+
+    generate_bounded_checkpoint(
+        spec,
+        (sealed_job,),
+        first_run,
+        first_export,
+        workers=1,
+        execution_options=options,
+        provenance=provenance,
+    )
+
+    resumed_run = tmp_path / "resumed-run"
+    shutil.copytree(first_export, resumed_run)
+    resumed_commitment = resumed_run / "data" / "manifests" / "sealed_commitment.json"
+    assert load_sealed_seed(private, resumed_commitment, purpose="sealed_evaluation") == 99887766
+    second_export = tmp_path / "checkpoint-2"
+    resumed = generate_bounded_checkpoint(
+        spec,
+        (sealed_job, nonsealed_job),
+        resumed_run,
+        second_export,
+        workers=1,
+        execution_options=options,
+        provenance=provenance,
+    )
+
+    assert resumed.completed == 2
+    assert (second_export / "data" / "manifests" / "sealed_commitment.json").is_file()
+    assert not any(path.name == private.name for path in second_export.rglob("*"))
 
 
 def test_kaggle_resume_rejects_private_seed_manifest_before_generation(tmp_path: Path) -> None:

@@ -47,6 +47,7 @@ standard path unchanged and opt in explicitly:
 --execution-backend kaggle
 --job-limit 1
 --checkpoint-root /kaggle/working/checkpoint
+--checkpoint-identity owner/checkpoint-dataset@exact-version
 ```
 
 The implementation should:
@@ -131,8 +132,12 @@ Upload two private Kaggle Datasets:
 2. `causaldem-pilot-checkpoint-00`: the verified current `runs/pilot` root with
    44 complete pairs and its manifest.
 
-Record the source commit SHA and checkpoint dataset version in the notebook
-metadata and in the checkpoint manifest. Do not regenerate the 44 pairs.
+Record the source commit SHA and immutable checkpoint dataset version in the
+notebook metadata and in the checkpoint manifest. Set
+`CAUSALDEM_CHECKPOINT_VERSION` to the exact pinned input version in
+`owner/dataset@number` form (or to a verified `sha256:<digest>` identity) and
+pass it as `--checkpoint-identity`. Do not use a staging path or mutable latest
+pointer, and do not regenerate the 44 pairs.
 
 ## Kaggle notebook setup
 
@@ -244,9 +249,11 @@ kaggle datasets version \
   --dir-mode zip
 ```
 
-The export directory must contain only the checkpoint root, manifest, and
-verified artifact files. Exclude source code, secrets, notebook outputs, core
-dumps, logs containing seeds, and scratch directories.
+The export directory must contain only the checkpoint root, manifest, verified
+artifact files, and the manifest-bound public
+`data/manifests/sealed_commitment.json` needed for sealed resume validation.
+Exclude the private sealed manifest, source code, secrets, notebook outputs,
+core dumps, logs containing seeds, and scratch directories.
 
 After publishing, record the returned dataset version or creation timestamp in
 a local notebook log. On the next session, attach that exact version rather

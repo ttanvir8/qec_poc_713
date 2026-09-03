@@ -41,6 +41,21 @@ def resolve_checkpoint_input(raw_value: str | None) -> Path:
 
 CHECKPOINT_INPUT = resolve_checkpoint_input(os.environ.get("CAUSALDEM_CHECKPOINT_INPUT"))
 
+
+def require_checkpoint_identity(raw_value: str | None) -> str:
+    value = (raw_value or "").strip()
+    dataset_version = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[1-9][0-9]*"
+    content_digest = r"sha256:[0-9a-f]{64}"
+    if not value or re.fullmatch(f"(?:{dataset_version}|{content_digest})", value) is None:
+        raise RuntimeError(
+            "set CAUSALDEM_CHECKPOINT_VERSION to the exact attached checkpoint dataset "
+            "version (owner/dataset@number) or a sha256 content digest"
+        )
+    return value
+
+
+CHECKPOINT_IDENTITY = require_checkpoint_identity(os.environ.get("CAUSALDEM_CHECKPOINT_VERSION"))
+
 WORKING_SOURCE = Path("/kaggle/working/source")
 WORKING_ROOT = Path("/kaggle/working/runs/pilot")
 EXPORT_ROOT = Path("/kaggle/working/export")
@@ -54,6 +69,7 @@ JOB_LIMIT = "1"
 MAX_AUTO_SAVED_WORKING_GIB = 20
 WORKING_STORAGE_STOP_GIB = 18
 MIN_FREE_GIB = 2
+NEW_PAIR_RESERVE_GIB = 2
 SESSION_LIMIT_SECONDS = 12 * 60 * 60
 STOP_BEFORE_LIMIT_SECONDS = 45 * 60
 DATA_ARTIFACT_FILES = frozenset(("arrays.npz", "metadata.json", "SHA256SUMS"))
@@ -134,17 +150,26 @@ def tree_size_gib(root: Path) -> float:
     return total / 1024**3
 
 
+def checkpoint_storage_projection(used_gib: float, checkpoint_gib: float) -> dict[str, object]:
+    projected_working_with_pair = used_gib + checkpoint_gib + NEW_PAIR_RESERVE_GIB
+    projected_with_export = projected_working_with_pair + checkpoint_gib + NEW_PAIR_RESERVE_GIB
+    return {
+        "projected_working_with_pair_gib": projected_working_with_pair,
+        "projected_with_export_gib": projected_with_export,
+        "new_pair_reserve_gib": NEW_PAIR_RESERVE_GIB,
+        "fits": projected_working_with_pair < WORKING_STORAGE_STOP_GIB
+        and projected_with_export <= MAX_AUTO_SAVED_WORKING_GIB - MIN_FREE_GIB,
+    }
+
+
 def assert_checkpoint_copy_fits(checkpoint_root: Path) -> None:
     checkpoint_gib = tree_size_gib(checkpoint_root)
     disk = disk_report(Path("/kaggle/working"))
-    projected_after_copy = disk["used_gib"] + checkpoint_gib
-    projected_full_copy_export = disk["used_gib"] + 2 * checkpoint_gib
-    if (
-        projected_after_copy >= WORKING_STORAGE_STOP_GIB
-        or projected_full_copy_export > MAX_AUTO_SAVED_WORKING_GIB - MIN_FREE_GIB
-    ):
+    projection = checkpoint_storage_projection(disk["used_gib"], checkpoint_gib)
+    if projection["fits"] is not True:
         raise RuntimeError(
-            "full-copy checkpoint would exceed the 20 GiB Kaggle working limit; "
+            "current working files, checkpoint copy, 2 GiB per new pair, and full export "
+            "copy would exceed the 20 GiB Kaggle working limit; "
             "attach a smaller sharded checkpoint dataset or run the checkpoint "
             "export on persistent storage before attempting this session"
         )
@@ -152,8 +177,7 @@ def assert_checkpoint_copy_fits(checkpoint_root: Path) -> None:
         json.dumps(
             {
                 "checkpoint_input_gib": checkpoint_gib,
-                "projected_after_copy_gib": projected_after_copy,
-                "projected_full_copy_export_gib": projected_full_copy_export,
+                **projection,
             },
             indent=2,
         )
@@ -285,14 +309,14 @@ from causaldem_qec.simulate import STANDARD_GENERATION_LAW_VERSION, _resolved_co
 repo = Path({str(REPO)!r})
 config = Path({str(CONFIG)!r})
 working_root = Path({str(WORKING_ROOT)!r})
-export_pilot = Path({str(EXPORT_PILOT)!r})
+checkpoint_identity = {CHECKPOINT_IDENTITY!r}
 
 source_commit = (repo / "COMMIT_SHA.txt").read_text(encoding="utf-8").strip()
 expected_provenance = ManifestProvenance(
     source_commit=source_commit,
     execution_backend="kaggle",
     generation_law_version=STANDARD_GENERATION_LAW_VERSION,
-    checkpoint_identity=f"checkpoint-root:{{export_pilot.resolve()}}",
+    checkpoint_identity=checkpoint_identity,
 )
 expected_hash = _resolved_config_hash(load_spec(repo / config))
 manifest_path = working_root / "run_manifest.json"
@@ -386,6 +410,8 @@ try:
         JOB_LIMIT,
         "--checkpoint-root",
         str(EXPORT_PILOT),
+        "--checkpoint-identity",
+        CHECKPOINT_IDENTITY,
         *sealed_args,
     ]
     run(generate_command, cwd=REPO)
@@ -414,11 +440,14 @@ def is_allowed_checkpoint_payload_path(relative_path: Path) -> bool:
     parts = relative_path.parts
     if parts == ("pilot", "run_manifest.json"):
         return True
-    if len(parts) != 6:
+    if parts == ("pilot", "data", "manifests", "sealed_commitment.json"):
+        return True
+    if len(parts) != 7:
         return False
-    root, lane, split, condition_id, trajectory_id, filename = parts
+    root, data, lane, split, condition_id, trajectory_id, filename = parts
     return (
         root == "pilot"
+        and data == "data"
         and lane in DATA_ARTIFACT_LANES
         and split in DATA_ARTIFACT_SPLITS
         and bool(condition_id)

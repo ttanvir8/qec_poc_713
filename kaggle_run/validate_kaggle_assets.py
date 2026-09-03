@@ -64,7 +64,7 @@ def _load_runner_function(
     *,
     constants: tuple[str, ...] = (),
 ) -> Callable[..., object]:
-    namespace: dict[str, object] = {"Path": Path}
+    namespace: dict[str, object] = {"Path": Path, "re": re}
     nodes: list[ast.stmt] = [_constant_assign(tree, constant) for constant in constants]
     nodes.append(_function_node(tree, name))
     module = ast.Module(body=nodes, type_ignores=[])
@@ -91,6 +91,46 @@ def _assert_default_checkpoint_resolution(tree: ast.Module) -> None:
         raise AssertionError("custom checkpoint input was not preserved")
 
 
+def _assert_external_checkpoint_identity(tree: ast.Module) -> None:
+    resolver = _load_runner_function(tree, "require_checkpoint_identity")
+    for raw in (None, "", "   "):
+        try:
+            resolver(raw)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("checkpoint identity must be supplied externally")
+    identity = "owner/causaldem-pilot-checkpoint@7"
+    if resolver(f"  {identity}  ") != identity:
+        raise AssertionError("external checkpoint identity was not preserved")
+
+
+def _assert_storage_projection_reserves_new_pair_and_export(tree: ast.Module) -> None:
+    projection = _load_runner_function(
+        tree,
+        "checkpoint_storage_projection",
+        constants=(
+            "MAX_AUTO_SAVED_WORKING_GIB",
+            "WORKING_STORAGE_STOP_GIB",
+            "MIN_FREE_GIB",
+            "NEW_PAIR_RESERVE_GIB",
+        ),
+    )
+    fits = projection(1.0, 5.0)
+    if fits != {
+        "projected_working_with_pair_gib": 8.0,
+        "projected_with_export_gib": 15.0,
+        "new_pair_reserve_gib": 2,
+        "fits": True,
+    }:
+        raise AssertionError(f"unexpected checkpoint storage projection: {fits}")
+    blocked = projection(1.0, 7.0)
+    if blocked["projected_working_with_pair_gib"] != 10.0:
+        raise AssertionError("working-root projection omits the new pair reserve")
+    if blocked["projected_with_export_gib"] != 19.0 or blocked["fits"] is not False:
+        raise AssertionError("export projection omits the new pair or fails to stop")
+
+
 def _assert_no_project_imports_in_notebook_interpreter(tree: ast.Module) -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("causaldem_qec"):
@@ -113,13 +153,15 @@ def _assert_exact_export_allowlist(tree: ast.Module) -> None:
     )
     allowed = (
         Path("pilot/run_manifest.json"),
-        Path("pilot/observable/train/repetition_d3__f01/0/arrays.npz"),
-        Path("pilot/labels/sealed_test/surface_d5__f14_negative/63/SHA256SUMS"),
+        Path("pilot/data/manifests/sealed_commitment.json"),
+        Path("pilot/data/observable/train/repetition_d3__f01/0/arrays.npz"),
+        Path("pilot/data/labels/sealed_test/surface_d5__f14_negative/63/SHA256SUMS"),
     )
     denied = (
+        Path("pilot/data/manifests/sealed_private.json"),
         Path("pilot/source/pyproject.toml"),
-        Path("pilot/observable/train/repetition_d3__f01/0/debug.log"),
-        Path("pilot/observable/train/repetition_d3__f01/staging.tmp/arrays.npz"),
+        Path("pilot/data/observable/train/repetition_d3__f01/0/debug.log"),
+        Path("pilot/data/observable/train/repetition_d3__f01/staging.tmp/arrays.npz"),
         Path("dataset-metadata.json"),
     )
     for path in allowed:
@@ -132,6 +174,8 @@ def _assert_exact_export_allowlist(tree: ast.Module) -> None:
 
 def _assert_required_runner_structure(runner: str, tree: ast.Module) -> None:
     _assert_default_checkpoint_resolution(tree)
+    _assert_external_checkpoint_identity(tree)
+    _assert_storage_projection_reserves_new_pair_and_export(tree)
     _assert_no_project_imports_in_notebook_interpreter(tree)
     _assert_exact_export_allowlist(tree)
     required = (
@@ -143,6 +187,8 @@ def _assert_required_runner_structure(runner: str, tree: ast.Module) -> None:
         "kaggle --version",
         "git_validation",
         "20 GiB Kaggle working limit",
+        "CAUSALDEM_CHECKPOINT_VERSION",
+        "--checkpoint-identity",
     )
     _assert_contains(runner, required, source=RUNNER.name)
     forbidden = ("forbidden_names", "commit_from_copy")
@@ -175,6 +221,8 @@ def validate() -> None:
         "kaggle --version",
         "UserSecretsClient",
         "COMMIT_SHA.txt",
+        "CAUSALDEM_CHECKPOINT_VERSION",
+        "--checkpoint-identity",
     )
     _assert_contains(runner, required_runner_terms, source=RUNNER.name)
     _assert_required_runner_structure(runner, tree)
@@ -202,6 +250,8 @@ def validate() -> None:
         "exact allowlist",
         "sharded checkpoint",
         "kaggle --version",
+        "exact attached checkpoint dataset version",
+        "2 GiB per new pair",
         "final local verification",
         "Do not paste",
     )
