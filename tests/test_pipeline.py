@@ -5,12 +5,13 @@ import numpy as np
 import pytest
 
 from causaldem_qec.artifacts import publish_trajectory
-from causaldem_qec.cli import main
+from causaldem_qec.cli import main, select_pilot_partition
 from causaldem_qec.core import (
     LabelTrajectory,
     ManifestProvenance,
     ObservableTrajectory,
     TrajectoryJob,
+    expand_jobs,
     load_spec,
 )
 from causaldem_qec.report import DATASET_EDA_SECTIONS, build_dataset_eda, validate_inventory
@@ -116,6 +117,27 @@ def test_dataset_eda_emits_every_pre_model_section_in_bounded_chunks(
     assert all(record.output_path.exists() for record in index.section_records.values())
     assert "PILOT / NOT FINAL" in (tmp_path / "data_card.md").read_text(encoding="utf-8")
     assert "DQ08" in (tmp_path / "validation_report.json").read_text(encoding="utf-8")
+
+
+def test_pilot_partition_selection_is_disjoint_and_covers_nonsealed_jobs() -> None:
+    spec = load_spec(Path("configs/poc_pilot.json"))
+    jobs = expand_jobs(spec, include_sealed=False)
+
+    shards = [select_pilot_partition(spec, jobs, f"shard{index}") for index in range(1, 4)]
+
+    assert [len(shard) for shard in shards] == [20, 20, 24]
+    assert len({(job.condition_id, job.trajectory_id) for shard in shards for job in shard}) == 64
+    assert {(job.condition_id, job.trajectory_id) for shard in shards for job in shard} == {
+        (job.condition_id, job.trajectory_id) for job in jobs
+    }
+    assert all(job.split != "sealed_test" for shard in shards for job in shard)
+
+
+def test_pilot_partition_selection_requires_pilot_config() -> None:
+    spec = load_spec(Path("configs/poc.json"))
+
+    with pytest.raises(ValueError, match="pilot configuration"):
+        select_pilot_partition(spec, (), "shard1")
 
 
 def test_report_fails_on_duplicate_trajectory_id() -> None:

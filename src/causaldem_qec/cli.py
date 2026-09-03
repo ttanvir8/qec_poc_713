@@ -36,6 +36,9 @@ class StoragePreflightError(ValueError):
     """The pilot root does not have the documented minimum free space."""
 
 
+PILOT_PARTITIONS = ("shard1", "shard2", "shard3")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="causaldem-poc")
     parser.add_argument(
@@ -57,10 +60,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-root", type=Path)
     parser.add_argument("--checkpoint-identity")
     parser.add_argument("--checkpoint-version")
+    parser.add_argument(
+        "--pilot-partition",
+        choices=PILOT_PARTITIONS,
+        help="generate one fresh non-sealed pilot shard",
+    )
     parser.add_argument("--sealed-manifest", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--reports-root", type=Path, default=Path("reports/dataset_eda"))
     return parser
+
+
+def select_pilot_partition(
+    spec: PocSpec,
+    jobs: Sequence[TrajectoryJob],
+    partition: str | None,
+) -> tuple[TrajectoryJob, ...]:
+    """Select a deterministic fresh shard without changing the pilot config."""
+    if partition is None:
+        return tuple(jobs)
+    if spec.dataset_profile != "pilot":
+        raise ValueError("pilot partition selection requires the pilot configuration")
+    if partition not in PILOT_PARTITIONS:
+        raise ValueError(f"unknown pilot partition: {partition}")
+
+    normal = tuple(spec.pilot_partitions["normal"])
+    development = tuple(spec.pilot_partitions["development"])
+    nonsealed_conditions = normal + development
+    condition_groups = {
+        "shard1": frozenset(nonsealed_conditions[:5]),
+        "shard2": frozenset(nonsealed_conditions[5:10]),
+        "shard3": frozenset(nonsealed_conditions[10:]),
+    }
+    selected_conditions = condition_groups[partition]
+    return tuple(job for job in jobs if job.condition_id in selected_conditions)
 
 
 def _sealed_commitment_path(spec: PocSpec, output_root: Path) -> Path:
@@ -322,6 +355,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.sealed_manifest is not None
             else expand_jobs(spec, include_sealed=False)
         )
+        jobs = select_pilot_partition(spec, jobs, args.pilot_partition)
         manifest = generate_matrix(spec, jobs, args.output_root, workers=args.workers)
         print(manifest.manifest_hash)
         return 0
@@ -345,6 +379,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.sealed_manifest is not None
             else expand_jobs(spec, include_sealed=False)
         )
+        jobs = select_pilot_partition(spec, jobs, args.pilot_partition)
         if args.dry_run:
             print(
                 json.dumps(

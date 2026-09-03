@@ -214,7 +214,19 @@ def clone_command(repo_url: str, repo_ref: str, destination: Path) -> list[str]:
     ]
 
 
+def should_reuse_clone(destination: Path) -> bool:
+    return (
+        destination.is_dir()
+        and (destination / ".git").exists()
+        and (destination / "pyproject.toml").is_file()
+    )
+
+
 def clone_source() -> Path:
+    if should_reuse_clone(WORKING_SOURCE):
+        source_commit = run(["git", "rev-parse", "HEAD"], cwd=WORKING_SOURCE).strip()
+        print(json.dumps({"source_commit": source_commit, "git_validation": "reused_git_head"}))
+        return WORKING_SOURCE
     if WORKING_SOURCE.exists():
         raise RuntimeError(f"{WORKING_SOURCE} already exists; inspect before reuse")
     run(clone_command(REPO_URL, REPO_REF, WORKING_SOURCE))

@@ -240,3 +240,24 @@ uv run pytest -m slow -q
 Then run the report or notebook export stages required by the project plan. Keep
 reports separate from checkpoint artifacts and label all pilot outputs
 `PILOT / NOT FINAL`.
+
+## 12. Fresh three-shard generation without a checkpoint
+
+For a fresh non-sealed run, the CLI supports three deterministic shards. The
+unchanged pilot configuration is used for every shard; `--pilot-partition` only
+selects which existing jobs are scheduled:
+
+```bash
+uv run causaldem-poc generate \
+  --config configs/poc_pilot.json \
+  --output-root /kaggle/working/shard-1/pilot \
+  --workers 1 \
+  --pilot-partition shard1
+```
+
+The shard sizes are 20, 20, and 24 jobs. Run `shard2` and `shard3` in separate
+Kaggle sessions using separate output roots. Verify each shard against its own
+root after generation. Each shard is intentionally incomplete, so run the
+final full-dataset verification only after merging all three shard roots on a
+machine with enough storage. These fresh shards contain only normal and
+development jobs; sealed jobs still require the private sealed manifest.
