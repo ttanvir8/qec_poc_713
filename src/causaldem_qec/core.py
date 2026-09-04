@@ -312,6 +312,8 @@ class GenerationRequest:
     spec: PocSpec
     job: TrajectoryJob
     root: Path
+    generation_mode: GenerationMode = "standard"
+    generation_chunk_rounds: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -83,6 +83,17 @@ class BuiltEpisode:
     circuit_hash: str
 
 
+@dataclass(frozen=True, slots=True)
+class EpisodeLayout:
+    """Metadata needed for DEM truth without retaining an episode circuit."""
+
+    detector_round: np.ndarray
+    detector_role: np.ndarray
+    detector_phase: np.ndarray
+    round_instruction_ranges: tuple[tuple[int, int], ...]
+    circuit_length: int
+
+
 class InvalidCircuit(ValueError):
     pass
 
@@ -186,6 +197,58 @@ def stationary_ar1(phi: float, size: tuple[int, int], rng: np.random.Generator) 
     values[0] = rng.normal(size=size[1])
     for index in range(1, size[0]):
         values[index] = phi * values[index - 1] + innovation_sd * rng.normal(size=size[1])
+    return values
+
+
+def _stationary_ar1_chunk(
+    phi: float,
+    rows: int,
+    columns: int,
+    rng: np.random.Generator,
+    previous: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generate one contiguous AR(1) range and return its final state."""
+    if rows < 1:
+        raise InvalidPhysicalPath("AR chunk must contain at least one row")
+    innovation_sd = np.sqrt(1.0 - phi * phi)
+    values = np.empty((rows, columns), dtype=np.float64)
+    if previous is None:
+        values[0] = rng.normal(size=columns)
+    else:
+        if previous.shape != (columns,):
+            raise InvalidPhysicalPath("AR state shape does not match the component layout")
+        values[0] = phi * previous + innovation_sd * rng.normal(size=columns)
+    for index in range(1, rows):
+        values[index] = phi * values[index - 1] + innovation_sd * rng.normal(size=columns)
+    return values, values[-1].copy()
+
+
+def _stationary_ar1_segment(
+    phi: float,
+    rows: int,
+    columns: int,
+    start: int,
+    stop: int,
+    rng: np.random.Generator,
+    preceding: Sequence[tuple[float, int, int]] = (),
+) -> np.ndarray:
+    """Return one AR(1) segment after consuming preceding standard-stream draws."""
+    for preceding_phi, preceding_rows, preceding_columns in preceding:
+        state: np.ndarray | None = None
+        for _ in range(preceding_rows):
+            if state is None:
+                state = rng.normal(size=preceding_columns)
+            else:
+                state = preceding_phi * state + np.sqrt(
+                    1.0 - preceding_phi * preceding_phi
+                ) * rng.normal(size=preceding_columns)
+    state = None
+    for _ in range(start):
+        if state is None:
+            state = rng.normal(size=columns)
+        else:
+            state = phi * state + np.sqrt(1.0 - phi * phi) * rng.normal(size=columns)
+    values, _ = _stationary_ar1_chunk(phi, stop - start, columns, rng, state)
     return values
 
 
@@ -321,14 +384,22 @@ def canonicalize_test_dem(
 
 
 def _episode_layout(
-    circuit: stim.Circuit, episodes: Sequence[BuiltEpisode]
-) -> tuple[dict[int, tuple[int, int, int, int]], tuple[tuple[int, int, BuiltEpisode], ...]]:
+    circuit: stim.Circuit, episodes: Sequence[BuiltEpisode | EpisodeLayout]
+) -> tuple[
+    dict[int, tuple[int, int, int, int]],
+    tuple[tuple[int, int, BuiltEpisode | EpisodeLayout], ...],
+]:
     detectors: dict[int, tuple[int, int, int, int]] = {}
-    spans: list[tuple[int, int, BuiltEpisode]] = []
+    spans: list[tuple[int, int, BuiltEpisode | EpisodeLayout]] = []
     detector_offset = 0
     instruction_offset = 0
     for episode_index, episode in enumerate(episodes):
-        spans.append((instruction_offset, instruction_offset + len(list(episode.circuit)), episode))
+        circuit_length = (
+            len(list(episode.circuit))
+            if isinstance(episode, BuiltEpisode)
+            else episode.circuit_length
+        )
+        spans.append((instruction_offset, instruction_offset + circuit_length, episode))
         for local, source_round in enumerate(episode.detector_round):
             detectors[detector_offset + local] = (
                 episode_index,
@@ -337,14 +408,14 @@ def _episode_layout(
                 int(episode.detector_phase[local]),
             )
         detector_offset += episode.detector_round.size
-        instruction_offset += len(list(episode.circuit))
+        instruction_offset += circuit_length
     if detector_offset != circuit.num_detectors:
         raise InvalidCircuit("episode map does not cover trajectory detector IDs")
     return detectors, tuple(spans)
 
 
 def _canonical_dem_events(
-    circuit: stim.Circuit, episode_map: Sequence[BuiltEpisode]
+    circuit: stim.Circuit, episode_map: Sequence[BuiltEpisode | EpisodeLayout]
 ) -> tuple[tuple[float, tuple[tuple[int, int, int], ...], tuple[int, ...], bool, int], ...]:
     """Compile and canonicalize an undecomposed trajectory DEM using physical source locations."""
     dem = circuit.detector_error_model(
@@ -418,14 +489,14 @@ def _canonical_dem_events(
 
 
 def canonicalize_dem(
-    circuit: stim.Circuit, episode_map: Sequence[BuiltEpisode]
+    circuit: stim.Circuit, episode_map: Sequence[BuiltEpisode | EpisodeLayout]
 ) -> CanonicalCatalog:
     events = _canonical_dem_events(circuit, episode_map)
     return _catalog_from_events(tuple(event[:4] for event in events))
 
 
 def canonicalize_dem_truth(
-    circuit: stim.Circuit, episode_map: Sequence[BuiltEpisode]
+    circuit: stim.Circuit, episode_map: Sequence[BuiltEpisode | EpisodeLayout]
 ) -> CanonicalDemTruth:
     """Derive frozen round truth from the complete, undecomposed trajectory DEM."""
     events = _canonical_dem_events(circuit, episode_map)
@@ -964,6 +1035,29 @@ def _geometric_run_mask(
     return mask
 
 
+def _geometric_run_mask_chunk(
+    rounds: int,
+    hazard: float,
+    mean_duration: float,
+    rng: np.random.Generator,
+    active_remaining: int,
+) -> tuple[np.ndarray, int]:
+    """Generate a contiguous burst-mask chunk and carry an open run forward."""
+    mask = np.zeros(rounds, dtype=np.bool_)
+    index = 0
+    while index < rounds:
+        if active_remaining:
+            mask[index] = True
+            active_remaining -= 1
+            index += 1
+            continue
+        if rng.random() < hazard:
+            active_remaining = int(rng.geometric(1.0 / mean_duration))
+            continue
+        index += 1
+    return mask, active_remaining
+
+
 def _canonical_component_pairs(
     components: tuple[PhysicalComponent, ...],
 ) -> tuple[tuple[int, int], ...]:
@@ -1099,6 +1193,268 @@ def generate_dynamics(
     return PhysicalNoisePath(
         component_probability=probability,
         latent_factor=np.asarray(all_factors[discarded:], dtype=np.float64),
+        lower_bound=lower,
+        upper_bound=upper,
+        missingness_parameters=missingness,
+        observation_flip_probability=flip_probability,
+        contamination_is_post_sampling=contamination,
+        generator_metadata=metadata,
+    )
+
+
+def generate_dynamics_bounded(
+    spec: PocSpec,
+    job: TrajectoryJob,
+    scored_rounds: int | None = None,
+    burn_in: int | None = None,
+    *,
+    chunk_rounds: int,
+    attempt: int = 0,
+) -> PhysicalNoisePath:
+    """Generate a bounded-mode path while retaining the standard stream contract."""
+    if chunk_rounds < 1 or chunk_rounds % spec.episode_rounds:
+        raise InvalidPhysicalPath(
+            "generation chunk rounds must be a positive episode-aligned value"
+        )
+    scored = spec.scored_rounds if scored_rounds is None else scored_rounds
+    discarded = spec.burn_in_rounds if burn_in is None else burn_in
+    if scored <= 0 or discarded < 0:
+        raise InvalidPhysicalPath("round counts must be positive after burn-in")
+    components = component_layout(job.circuit, spec)
+    lower = np.asarray([component.lower for component in components], dtype=np.float64)
+    upper = np.asarray([component.upper for component in components], dtype=np.float64)
+    total = scored + discarded
+    if job.dynamics_id not in {
+        "f01",
+        "f02",
+        "f03",
+        "f06",
+        "f07",
+        "f08",
+        "f12",
+        "f14_positive",
+        "f14_negative",
+    }:
+        return generate_dynamics(spec, job, scored, discarded, attempt=attempt)
+
+    dynamics_rng = _rng(spec, job, "dynamics", attempt)
+    probabilities: list[np.ndarray] = []
+    factors: list[np.ndarray] = []
+    factor_count = min(2, len(components))
+    offset_state: np.ndarray | None = None
+    offsets: np.ndarray | None = None
+    burn_in_final_state: np.ndarray | None = None
+    phase = 0.0
+    phase_cumulative: np.ndarray | None = None
+    burst_rng: np.random.Generator | None = None
+    burst_remaining = 0
+    burst_hazard = 0.0
+    burst_mean_duration = 0.0
+    burst_amplitude = 0.0
+    if job.dynamics_id == "f01":
+        offsets = dynamics_rng.normal(
+            scale=_config_float(spec, "f01", "offset_sd"), size=len(components)
+        )
+    elif job.dynamics_id == "f02":
+        ar_phi = _config_float(spec, "f02", "phi")
+    elif job.dynamics_id in {"f03", "f07", "f08"}:
+        config = spec.dynamics["f03"]
+        shared_phi = _config_pair(spec, "f03", "shared_phi")
+        local_phi = _number(config["local_phi"], "f03.local_phi")
+        local_sd = _number(config["local_sd"], "f03.local_sd")
+        type_sign = config["type_sign"]
+        if not isinstance(type_sign, Mapping):
+            raise InvalidPhysicalPath("invalid f03.type_sign")
+        signs = np.asarray(
+            [
+                _number(type_sign[NOISE_KIND[component.kind][1]], "f03.type_sign")
+                for component in components
+            ],
+            dtype=np.float64,
+        )
+        geometry = np.linspace(-1.0, 1.0, len(components), dtype=np.float64)
+        if len(components) > 1:
+            geometry /= np.linalg.norm(geometry)
+        loadings = (
+            np.column_stack(
+                [
+                    np.full(
+                        len(components), _number(config["global_loading"], "f03.global_loading")
+                    ),
+                    _number(config["x_loading"], "f03.x_loading") * geometry,
+                ]
+            )
+            * signs[:, None]
+        )
+    elif job.dynamics_id == "f06":
+        phase = dynamics_rng.uniform(0.0, 2.0 * np.pi)
+        periods = np.linspace(
+            _config_float(spec, "f06", "start_period"),
+            _config_float(spec, "f06", "stop_period"),
+            total,
+        )
+        phase_cumulative = np.cumsum(1.0 / periods)
+    elif job.dynamics_id == "f12":
+        config = spec.dynamics["f12"]
+        shared_phi = _config_pair(spec, "f03", "shared_phi")
+        base_config = spec.dynamics["f03"]
+        local_phi = _number(base_config["local_phi"], "f03.local_phi")
+        local_sd = _number(base_config["local_sd"], "f03.local_sd")
+        type_sign = base_config["type_sign"]
+        if not isinstance(type_sign, Mapping):
+            raise InvalidPhysicalPath("invalid f03.type_sign")
+        signs = np.asarray(
+            [
+                _number(type_sign[NOISE_KIND[component.kind][1]], "f03.type_sign")
+                for component in components
+            ],
+            dtype=np.float64,
+        )
+        geometry = np.linspace(-1.0, 1.0, len(components), dtype=np.float64)
+        if len(components) > 1:
+            geometry /= np.linalg.norm(geometry)
+        loadings = (
+            np.column_stack(
+                [
+                    np.full(
+                        len(components),
+                        _number(base_config["global_loading"], "f03.global_loading"),
+                    ),
+                    _number(base_config["x_loading"], "f03.x_loading") * geometry,
+                ]
+            )
+            * signs[:, None]
+        )
+        burst_hazard = _number(config["onset_hazard"], "f12.onset_hazard")
+        burst_mean_duration = _number(config["mean_duration"], "f12.mean_duration")
+        burst_amplitude = _number(config["amplitude"], "f12.amplitude")
+        burst_rng = _rng(spec, job, "burst", attempt)
+    else:
+        config = spec.dynamics[job.dynamics_id]
+        ar_phi = _number(config["phi"], f"{job.dynamics_id}.phi")
+        sign = _number(config["sign"], f"{job.dynamics_id}.sign")
+        pairs = _canonical_component_pairs(components)
+    driver_state: np.ndarray | None = None
+    for start in range(0, total, chunk_rounds):
+        stop = min(total, start + chunk_rounds)
+        if job.dynamics_id == "f01":
+            assert offsets is not None
+            chunk_latent = np.broadcast_to(offsets, (stop - start, len(components))).copy()
+        elif job.dynamics_id == "f02":
+            chunk_latent, offset_state = _stationary_ar1_chunk(
+                ar_phi, stop - start, len(components), dynamics_rng, offset_state
+            )
+            chunk_latent *= _config_float(spec, "f02", "loading")
+        elif job.dynamics_id == "f06":
+            assert phase_cumulative is not None
+            cumulative = phase_cumulative[start:stop]
+            chirp = np.sin(2.0 * np.pi * cumulative + phase)
+            chunk_latent = _config_float(spec, "f06", "amplitude") * chirp[:, None]
+            chunk_factors = np.column_stack((chirp, np.cos(2.0 * np.pi * cumulative + phase)))
+        elif job.dynamics_id in {"f03", "f07", "f08", "f12"}:
+            shared = np.column_stack(
+                (
+                    _stationary_ar1_segment(
+                        shared_phi[0], total, 1, start, stop, _rng(spec, job, "dynamics", attempt)
+                    ),
+                    _stationary_ar1_segment(
+                        shared_phi[1],
+                        total,
+                        1,
+                        start,
+                        stop,
+                        _rng(spec, job, "dynamics", attempt),
+                        preceding=((shared_phi[0], total, 1),),
+                    ),
+                )
+            )
+            local = (
+                _stationary_ar1_segment(
+                    local_phi,
+                    total,
+                    len(components),
+                    start,
+                    stop,
+                    _rng(spec, job, "dynamics", attempt),
+                    preceding=((shared_phi[0], total, 1), (shared_phi[1], total, 1)),
+                )
+                * local_sd
+            )
+            chunk_latent = shared @ loadings.T + local
+            chunk_factors = shared
+        else:
+            assert pairs is not None
+            driver, driver_state = _stationary_ar1_chunk(
+                ar_phi, stop - start, len(pairs), dynamics_rng, driver_state
+            )
+            chunk_latent = np.empty((stop - start, len(components)), dtype=np.float64)
+            amplitude = _number(config["amplitude"], f"{job.dynamics_id}.amplitude")
+            for pair_index, (first, second) in enumerate(pairs):
+                chunk_latent[:, first] = amplitude * driver[:, pair_index]
+                chunk_latent[:, second] = amplitude * sign * driver[:, pair_index]
+            chunk_factors = np.column_stack((driver[:, 0], sign * driver[:, 0]))
+        if job.dynamics_id == "f12":
+            assert burst_rng is not None
+            burst, burst_remaining = _geometric_run_mask_chunk(
+                stop - start,
+                burst_hazard,
+                burst_mean_duration,
+                burst_rng,
+                burst_remaining,
+            )
+            chunk_latent += burst_amplitude * burst[:, None] * loadings.sum(axis=1)
+        if job.dynamics_id in {"f01", "f02"}:
+            chunk_factors = chunk_latent[:, :factor_count]
+        if discarded and start < discarded <= stop:
+            burn_in_final_state = chunk_latent[discarded - start - 1].copy()
+        scored_start = max(discarded, start)
+        if scored_start < stop:
+            scored_latent = chunk_latent[scored_start - start :]
+            probabilities.append(bounded_probability(scored_latent, lower, upper))
+            factors.append(np.asarray(chunk_factors[scored_start - start :], dtype=np.float64))
+
+    layout_commitment = sha256(
+        repr(tuple((item.kind, item.targets) for item in components)).encode("utf-8")
+    ).hexdigest()
+    missingness: Mapping[str, float] = MappingProxyType({})
+    flip_probability = 0.0
+    contamination = False
+    if job.dynamics_id == "f07":
+        config = spec.dynamics["f07"]
+        missingness = MappingProxyType(
+            {
+                "mcar": _number(config["mcar"], "f07.mcar"),
+                "burst_hazard": _number(config["burst_hazard"], "f07.burst_hazard"),
+                "mean_duration": _number(config["mean_duration"], "f07.mean_duration"),
+                "detector_fraction": _number(config["detector_fraction"], "f07.detector_fraction"),
+            }
+        )
+    if job.dynamics_id == "f08":
+        flip_probability = _config_float(spec, "f08", "flip_probability")
+        contamination = True
+    base_parameters: object = MappingProxyType({})
+    base = spec.dynamics[job.dynamics_id].get("base")
+    if isinstance(base, str):
+        base_parameters = spec.dynamics[base]
+    metadata: Mapping[str, object] = MappingProxyType(
+        {
+            "dynamics_id": job.dynamics_id,
+            "burn_in_rounds": discarded,
+            "burn_in_final_state": tuple(float(value) for value in burn_in_final_state)
+            if burn_in_final_state is not None
+            else (),
+            "resolved_parameters": spec.dynamics[job.dynamics_id],
+            "base_parameters": base_parameters,
+            "component_layout_commitment": layout_commitment,
+            "component_bounds": tuple(
+                (NOISE_KIND[item.kind][1], item.lower, item.upper) for item in components
+            ),
+            "attempt": attempt,
+        }
+    )
+    return PhysicalNoisePath(
+        component_probability=np.concatenate(probabilities, axis=0),
+        latent_factor=np.concatenate(factors, axis=0),
         lower_bound=lower,
         upper_bound=upper,
         missingness_parameters=missingness,
@@ -1279,28 +1635,41 @@ def _apply_missingness(
     return valid
 
 
-def sample_trajectory(
-    spec: PocSpec, job: TrajectoryJob, path: PhysicalNoisePath, *, attempt: int = 0
+def _sample_trajectory_with_chunked_episodes(
+    spec: PocSpec,
+    job: TrajectoryJob,
+    path: PhysicalNoisePath,
+    *,
+    chunk_rounds: int,
+    attempt: int,
 ) -> SampledTrajectory:
     rounds = path.component_probability.shape[0]
     if rounds == 0 or rounds % spec.episode_rounds:
         raise InvalidPhysicalPath("sampled rounds must contain complete episodes")
+    if chunk_rounds < 1 or chunk_rounds % spec.episode_rounds:
+        raise InvalidPhysicalPath("sampling chunk rounds must be a positive episode-aligned value")
     components = component_layout(job.circuit)
     if path.component_probability.shape[1] != len(components):
         raise InvalidPhysicalPath("physical path component layout mismatch")
     episode_count = rounds // spec.episode_rounds
-    built_episodes = [
-        build_memory_episode(
-            job.circuit,
-            path.component_probability[index * 32 : (index + 1) * 32],
-            index,
-            spec,
-        )
-        for index in range(episode_count)
-    ]
     trajectory_circuit = stim.Circuit()
-    for built in built_episodes:
-        trajectory_circuit += built.circuit
+    episode_metadata: list[tuple[np.ndarray, np.ndarray, int]] = []
+    episodes_per_chunk = chunk_rounds // spec.episode_rounds
+    for chunk_start in range(0, episode_count, episodes_per_chunk):
+        chunk_stop = min(episode_count, chunk_start + episodes_per_chunk)
+        for index in range(chunk_start, chunk_stop):
+            built = build_memory_episode(
+                job.circuit,
+                path.component_probability[
+                    index * spec.episode_rounds : (index + 1) * spec.episode_rounds
+                ],
+                index,
+                spec,
+            )
+            trajectory_circuit += built.circuit
+            episode_metadata.append(
+                (built.detector_round, built.detector_role, built.detector_round.size)
+            )
     seed_sequence = derive_seed(
         job.root_seed,
         _integer(spec.raw["schema_version"], "schema_version"),
@@ -1312,15 +1681,14 @@ def sample_trajectory(
     fault_seed = int(seed_sequence.generate_state(1, dtype=np.uint64)[0])
     sampler = trajectory_circuit.compile_detector_sampler(seed=fault_seed)
     detectors, observables = sampler.sample(shots=1, separate_observables=True, bit_packed=False)
-    max_role = max(int(built.detector_role.max()) for built in built_episodes) + 1
+    max_role = max(int(roles.max()) for _, roles, _ in episode_metadata) + 1
     detector_bits = np.zeros((rounds, max_role), dtype=np.bool_)
     present = np.zeros((rounds, max_role), dtype=np.bool_)
     offset = 0
-    for episode_index, built in enumerate(built_episodes):
-        count = built.detector_round.size
+    for episode_index, (detector_round, detector_role, count) in enumerate(episode_metadata):
         for local_index in range(count):
-            row = episode_index * 32 + int(built.detector_round[local_index])
-            column = int(built.detector_role[local_index])
+            row = episode_index * spec.episode_rounds + int(detector_round[local_index])
+            column = int(detector_role[local_index])
             detector_bits[row, column] = detectors[0, offset + local_index]
             present[row, column] = True
         offset += count
@@ -1341,10 +1709,41 @@ def sample_trajectory(
         detector_bits=detector_bits,
         detector_valid=detector_valid,
         logical_observable=observables[0].astype(np.bool_, copy=False),
-        episode=global_round // np.uint32(32),
-        round_in_episode=global_round % np.uint32(32),
+        episode=global_round // np.uint32(spec.episode_rounds),
+        round_in_episode=global_round % np.uint32(spec.episode_rounds),
         detector_role=np.arange(max_role, dtype=np.uint16),
         circuit_phase=(global_round % np.uint32(32)).astype(np.uint8),
+    )
+
+
+def sample_trajectory(
+    spec: PocSpec, job: TrajectoryJob, path: PhysicalNoisePath, *, attempt: int = 0
+) -> SampledTrajectory:
+    """Sample using the compatibility-preserving full-circuit path."""
+    return _sample_trajectory_with_chunked_episodes(
+        spec,
+        job,
+        path,
+        chunk_rounds=path.component_probability.shape[0],
+        attempt=attempt,
+    )
+
+
+def sample_trajectory_bounded(
+    spec: PocSpec,
+    job: TrajectoryJob,
+    path: PhysicalNoisePath,
+    *,
+    chunk_rounds: int,
+    attempt: int = 0,
+) -> SampledTrajectory:
+    """Build episodes in bounded groups while retaining the full Stim sampler."""
+    return _sample_trajectory_with_chunked_episodes(
+        spec,
+        job,
+        path,
+        chunk_rounds=chunk_rounds,
+        attempt=attempt,
     )
 
 
@@ -1445,17 +1844,46 @@ def assemble_artifacts(
 ) -> tuple[ObservableTrajectory, LabelTrajectory, Mapping[str, object]]:
     """Assemble auditable public and offline-only lanes from one deterministic sample."""
     spec, job = request.spec, request.job
-    episode_map = tuple(
-        build_memory_episode(
-            job.circuit,
-            path.component_probability[
-                index * spec.episode_rounds : (index + 1) * spec.episode_rounds
-            ],
-            index,
-            spec,
-        )
-        for index in range(path.component_probability.shape[0] // spec.episode_rounds)
-    )
+    episode_count = path.component_probability.shape[0] // spec.episode_rounds
+    episode_map: list[BuiltEpisode | EpisodeLayout]
+    if request.generation_mode == "bounded":
+        chunk_rounds = request.generation_chunk_rounds
+        if chunk_rounds is None or chunk_rounds % spec.episode_rounds:
+            raise InvalidPhysicalPath("bounded assembly requires an episode-aligned chunk size")
+        episodes_per_chunk = chunk_rounds // spec.episode_rounds
+        episode_map = []
+        for chunk_start in range(0, episode_count, episodes_per_chunk):
+            chunk_stop = min(episode_count, chunk_start + episodes_per_chunk)
+            for index in range(chunk_start, chunk_stop):
+                built = build_memory_episode(
+                    job.circuit,
+                    path.component_probability[
+                        index * spec.episode_rounds : (index + 1) * spec.episode_rounds
+                    ],
+                    index,
+                    spec,
+                )
+                episode_map.append(
+                    EpisodeLayout(
+                        detector_round=built.detector_round,
+                        detector_role=built.detector_role,
+                        detector_phase=built.detector_phase,
+                        round_instruction_ranges=built.round_instruction_ranges,
+                        circuit_length=len(list(built.circuit)),
+                    )
+                )
+    else:
+        episode_map = [
+            build_memory_episode(
+                job.circuit,
+                path.component_probability[
+                    index * spec.episode_rounds : (index + 1) * spec.episode_rounds
+                ],
+                index,
+                spec,
+            )
+            for index in range(episode_count)
+        ]
     truth = canonicalize_dem_truth(sampled.circuit, episode_map)
     global_round = np.arange(path.component_probability.shape[0], dtype=np.uint32)
     observable = ObservableTrajectory(
@@ -1530,14 +1958,37 @@ def generate_job(request: GenerationRequest) -> TrajectoryResult:
     last_error: InvalidPhysicalPath | InvalidCircuit | ArtifactConflict | None = None
     for attempt in range(request.spec.retry_attempts):
         try:
-            path = generate_dynamics(
-                request.spec,
-                request.job,
-                request.spec.scored_rounds,
-                request.spec.burn_in_rounds,
-                attempt=attempt,
-            )
-            sampled = sample_trajectory(request.spec, request.job, path, attempt=attempt)
+            if request.generation_mode == "bounded":
+                if request.generation_chunk_rounds is None:
+                    raise InvalidPhysicalPath("bounded generation requires a chunk size")
+                path = generate_dynamics_bounded(
+                    request.spec,
+                    request.job,
+                    request.spec.scored_rounds,
+                    request.spec.burn_in_rounds,
+                    chunk_rounds=request.generation_chunk_rounds,
+                    attempt=attempt,
+                )
+            else:
+                path = generate_dynamics(
+                    request.spec,
+                    request.job,
+                    request.spec.scored_rounds,
+                    request.spec.burn_in_rounds,
+                    attempt=attempt,
+                )
+            if request.generation_mode == "bounded":
+                if request.generation_chunk_rounds is None:
+                    raise InvalidPhysicalPath("bounded generation requires a chunk size")
+                sampled = sample_trajectory_bounded(
+                    request.spec,
+                    request.job,
+                    path,
+                    chunk_rounds=request.generation_chunk_rounds,
+                    attempt=attempt,
+                )
+            else:
+                sampled = sample_trajectory(request.spec, request.job, path, attempt=attempt)
             observable, labels, metadata = assemble_artifacts(
                 request, path, sampled, attempt=attempt
             )
@@ -1566,6 +2017,8 @@ def _manifest_payload(
     provenance: ManifestProvenance | None = None,
     checkpoint_input_version: str | None = None,
     sealed_commitment: Mapping[str, str] | None = None,
+    generation_mode: str = "standard",
+    generation_chunk_rounds: int | None = None,
 ) -> dict[str, object]:
     ordered = [results[key] for key in sorted(results)]
     payload: dict[str, object] = {
@@ -1575,6 +2028,8 @@ def _manifest_payload(
             "trajectories_per_condition": spec.trajectories_per_condition,
             "burn_in_rounds": spec.burn_in_rounds,
             "scored_rounds": spec.scored_rounds,
+            "mode": generation_mode,
+            "chunk_rounds": generation_chunk_rounds,
         },
         "results": [
             {
@@ -1760,8 +2215,6 @@ def _validate_execution_identity(
         execution_options.checkpoint_identity,
         execution_options.checkpoint_version,
     )
-    if execution_options.generation_mode != "standard":
-        raise ValueError("bounded scientific generation is not implemented")
     if (
         provenance is None
         or provenance.execution_backend != execution_options.execution_backend
@@ -1883,6 +2336,8 @@ def assert_run_manifest_identity(
     checkpoint_version: str | None = None,
     *,
     allow_bound_provenance: bool = False,
+    generation_mode: str = "standard",
+    generation_chunk_rounds: int | None = None,
 ) -> None:
     """Reject a root already committed to another profile or resolved configuration."""
     manifest_path = root / "run_manifest.json"
@@ -1904,6 +2359,12 @@ def assert_run_manifest_identity(
             "trajectories_per_condition": spec.trajectories_per_condition,
             "burn_in_rounds": spec.burn_in_rounds,
             "scored_rounds": spec.scored_rounds,
+            "mode": generation_mode if provenance is None else provenance.generation_mode,
+            "chunk_rounds": (
+                generation_chunk_rounds
+                if provenance is None
+                else provenance.generation_chunk_rounds
+            ),
         }
         if document.get("generation") != expected_generation or document.get(
             "expected_job_keys"
@@ -1973,6 +2434,8 @@ def generate_matrix(
         spec,
         provenance,
         checkpoint_version=options.checkpoint_version,
+        generation_mode=options.generation_mode,
+        generation_chunk_rounds=options.generation_chunk_rounds,
     )
     manifest_path = root / "run_manifest.json"
     config_hash = _resolved_config_hash(spec)
@@ -2007,7 +2470,13 @@ def generate_matrix(
         else:
             request_jobs.append(job)
     requests = [
-        GenerationRequest(spec, job, root)
+        GenerationRequest(
+            spec,
+            job,
+            root,
+            generation_mode=options.generation_mode,
+            generation_chunk_rounds=options.generation_chunk_rounds,
+        )
         for job in select_incomplete_jobs(
             request_jobs,
             completed_job_keys=(),
@@ -2029,6 +2498,8 @@ def generate_matrix(
                     provenance=provenance,
                     checkpoint_input_version=options.checkpoint_version,
                     sealed_commitment=sealed_commitment,
+                    generation_mode=options.generation_mode,
+                    generation_chunk_rounds=options.generation_chunk_rounds,
                 ),
             )
     elif requests:
@@ -2047,6 +2518,8 @@ def generate_matrix(
                         provenance=provenance,
                         checkpoint_input_version=options.checkpoint_version,
                         sealed_commitment=sealed_commitment,
+                        generation_mode=options.generation_mode,
+                        generation_chunk_rounds=options.generation_chunk_rounds,
                     ),
                 )
     manifest_hash = write_manifest(
@@ -2057,6 +2530,8 @@ def generate_matrix(
             provenance=provenance,
             checkpoint_input_version=options.checkpoint_version,
             sealed_commitment=sealed_commitment,
+            generation_mode=options.generation_mode,
+            generation_chunk_rounds=options.generation_chunk_rounds,
         ),
     )
     base = _run_manifest(results, manifest_hash, provenance)

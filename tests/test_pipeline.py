@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from causaldem_qec.artifacts import publish_trajectory
-from causaldem_qec.cli import main, select_pilot_partition
+from causaldem_qec.cli import _execution_context, build_parser, main, select_pilot_partition
 from causaldem_qec.core import (
     LabelTrajectory,
     ManifestProvenance,
@@ -138,6 +138,58 @@ def test_pilot_partition_selection_requires_pilot_config() -> None:
 
     with pytest.raises(ValueError, match="pilot configuration"):
         select_pilot_partition(spec, (), "shard1")
+
+
+def test_bounded_generation_options_parse_and_flow_into_execution_context() -> None:
+    args = build_parser().parse_args(
+        [
+            "generate-pilot",
+            "--config",
+            "configs/poc_pilot.json",
+            "--generation-mode",
+            "bounded",
+            "--generation-chunk-rounds",
+            "256",
+        ]
+    )
+
+    options, provenance = _execution_context(args, load_spec(args.config))
+
+    assert options.generation_mode == "bounded"
+    assert options.generation_chunk_rounds == 256
+    assert provenance is None
+
+
+def test_bounded_generation_requires_a_chunk_size() -> None:
+    args = build_parser().parse_args(
+        [
+            "generate-pilot",
+            "--config",
+            "configs/poc_pilot.json",
+            "--generation-mode",
+            "bounded",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="chunk rounds.*required"):
+        _execution_context(args, load_spec(args.config))
+
+
+def test_bounded_generation_chunk_size_must_align_to_episode_rounds() -> None:
+    args = build_parser().parse_args(
+        [
+            "generate-pilot",
+            "--config",
+            "configs/poc_pilot.json",
+            "--generation-mode",
+            "bounded",
+            "--generation-chunk-rounds",
+            "250",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="multiple of episode_rounds"):
+        _execution_context(args, load_spec(args.config))
 
 
 def test_report_fails_on_duplicate_trajectory_id() -> None:

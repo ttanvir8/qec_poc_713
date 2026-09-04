@@ -61,6 +61,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-identity")
     parser.add_argument("--checkpoint-version")
     parser.add_argument(
+        "--generation-mode",
+        choices=("standard", "bounded"),
+        default="standard",
+        help="trajectory generation strategy",
+    )
+    parser.add_argument(
+        "--generation-chunk-rounds",
+        type=int,
+        help="number of rounds processed per bounded-generation chunk",
+    )
+    parser.add_argument(
         "--pilot-partition",
         choices=PILOT_PARTITIONS,
         help="generate one fresh non-sealed pilot shard",
@@ -224,11 +235,20 @@ def _path_contains(parent: Path, child: Path) -> bool:
 def _execution_context(
     args: argparse.Namespace, spec: PocSpec
 ) -> tuple[ExecutionOptions, ManifestProvenance | None]:
+    if args.generation_mode == "bounded":
+        if args.generation_chunk_rounds is None:
+            raise ValueError("generation chunk rounds are required for bounded generation")
+        if args.generation_chunk_rounds % spec.episode_rounds:
+            raise ValueError("generation chunk rounds must be a multiple of episode_rounds")
+    elif args.generation_chunk_rounds is not None:
+        raise ValueError("generation chunk rounds require bounded generation mode")
     options = ExecutionOptions(
         execution_backend=args.execution_backend,
         job_limit=args.job_limit,
         checkpoint_identity=args.checkpoint_identity,
         checkpoint_version=args.checkpoint_version,
+        generation_mode=args.generation_mode,
+        generation_chunk_rounds=args.generation_chunk_rounds,
     )
     if options.execution_backend == "local":
         if (
@@ -272,6 +292,8 @@ def _execution_context(
         execution_backend="kaggle",
         generation_law_version=STANDARD_GENERATION_LAW_VERSION,
         checkpoint_identity=options.checkpoint_identity,
+        generation_mode=options.generation_mode,
+        generation_chunk_rounds=options.generation_chunk_rounds,
     )
     return options, provenance
 

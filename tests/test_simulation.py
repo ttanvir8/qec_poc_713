@@ -33,6 +33,7 @@ from causaldem_qec.simulate import (
     dataset_gates_complete,
     generate_bounded_checkpoint,
     generate_dynamics,
+    generate_dynamics_bounded,
     generate_matrix,
     run_dataset_gates,
     select_incomplete_jobs,
@@ -90,7 +91,11 @@ def test_observation_corruption_does_not_change_physical_truth(job_for_family) -
     assert contaminated.contamination_is_post_sampling
 
 
-from causaldem_qec.simulate import build_memory_episode, sample_trajectory
+from causaldem_qec.simulate import (
+    build_memory_episode,
+    sample_trajectory,
+    sample_trajectory_bounded,
+)
 
 
 @pytest.mark.parametrize(
@@ -204,6 +209,20 @@ def test_sampled_circuit_phase_is_the_episode_round(job_for_family) -> None:
     job = job_for_family("f03", "surface_d3")
     sampled = sample_trajectory(spec, job, generate_dynamics(spec, job, 64, 8))
     np.testing.assert_array_equal(sampled.circuit_phase, np.tile(np.arange(32, dtype=np.uint8), 2))
+
+
+def test_bounded_sampling_preserves_full_sampler_output() -> None:
+    spec = _tiny_pilot_spec()
+    job = next(job for job in expand_jobs(spec, include_sealed=False) if job.dynamics_id == "f01")
+    path = generate_dynamics(spec, job, scored_rounds=256, burn_in=32)
+
+    standard = sample_trajectory(spec, job, path, attempt=1)
+    bounded = sample_trajectory_bounded(spec, job, path, chunk_rounds=64, attempt=1)
+
+    np.testing.assert_array_equal(bounded.detector_bits, standard.detector_bits)
+    np.testing.assert_array_equal(bounded.detector_valid, standard.detector_valid)
+    np.testing.assert_array_equal(bounded.logical_observable, standard.logical_observable)
+    assert str(bounded.circuit) == str(standard.circuit)
 
 
 def test_generator_metadata_contains_resolved_reproduction_parameters(job_for_family) -> None:
@@ -555,6 +574,129 @@ def test_bounded_generation_is_deterministic_across_clean_and_resumed_runs(
     assert second.generated == 1
     assert second.resumed == 1
     assert second.trajectory_hashes == clean.trajectory_hashes
+
+
+def test_bounded_and_standard_generation_have_identical_f01_artifact_hashes(
+    tmp_path: Path,
+) -> None:
+    spec = _tiny_pilot_spec()
+    job = next(job for job in expand_jobs(spec, include_sealed=False) if job.dynamics_id == "f01")
+    bounded_options = ExecutionOptions(
+        generation_mode="bounded",
+        generation_chunk_rounds=64,
+    )
+
+    standard = generate_matrix(spec, (job,), tmp_path / "standard", workers=1)
+    bounded = generate_matrix(
+        spec,
+        (job,),
+        tmp_path / "bounded",
+        workers=1,
+        execution_options=bounded_options,
+    )
+
+    assert bounded.trajectory_hashes == standard.trajectory_hashes
+    manifest = json.loads((tmp_path / "bounded" / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["generation"]["mode"] == "bounded"
+    assert manifest["generation"]["chunk_rounds"] == 64
+
+
+def test_f01_bounded_dynamics_streams_chunks_without_standard_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _tiny_pilot_spec()
+    job = next(job for job in expand_jobs(spec, include_sealed=False) if job.dynamics_id == "f01")
+    expected = generate_dynamics(spec, job, attempt=0)
+
+    def fail_standard(*args: object, **kwargs: object) -> object:
+        raise AssertionError("bounded f01 generation called the standard fallback")
+
+    monkeypatch.setattr("causaldem_qec.simulate.generate_dynamics", fail_standard)
+    actual = generate_dynamics_bounded(spec, job, chunk_rounds=64, attempt=0)
+
+    np.testing.assert_array_equal(actual.component_probability, expected.component_probability)
+    np.testing.assert_array_equal(actual.latent_factor, expected.latent_factor)
+    assert actual.generator_metadata == expected.generator_metadata
+
+
+@pytest.mark.parametrize("dynamics_id", ["f02", "f14_positive", "f14_negative"])
+def test_ar_bounded_dynamics_matches_standard_stream(
+    dynamics_id: str,
+) -> None:
+    spec = _tiny_pilot_spec()
+    job = next(
+        job for job in expand_jobs(spec, include_sealed=True) if job.dynamics_id == dynamics_id
+    )
+
+    expected = generate_dynamics(spec, job, attempt=1)
+    actual = generate_dynamics_bounded(spec, job, chunk_rounds=64, attempt=1)
+
+    np.testing.assert_array_equal(actual.component_probability, expected.component_probability)
+    np.testing.assert_array_equal(actual.latent_factor, expected.latent_factor)
+    assert actual.generator_metadata == expected.generator_metadata
+
+
+def test_f03_bounded_factor_dynamics_matches_standard_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _tiny_pilot_spec()
+    job = next(job for job in expand_jobs(spec, include_sealed=False) if job.dynamics_id == "f03")
+
+    expected = generate_dynamics(spec, job, attempt=1)
+    monkeypatch.setattr(
+        "causaldem_qec.simulate.generate_dynamics",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("bounded f03 generation called the standard fallback")
+        ),
+    )
+    actual = generate_dynamics_bounded(spec, job, chunk_rounds=64, attempt=1)
+
+    np.testing.assert_array_equal(actual.component_probability, expected.component_probability)
+    np.testing.assert_array_equal(actual.latent_factor, expected.latent_factor)
+    assert actual.generator_metadata == expected.generator_metadata
+
+
+@pytest.mark.parametrize("dynamics_id", ["f07", "f08"])
+def test_derived_factor_bounded_dynamics_matches_standard_stream(
+    dynamics_id: str,
+) -> None:
+    spec = _tiny_pilot_spec()
+    job = next(
+        job for job in expand_jobs(spec, include_sealed=False) if job.dynamics_id == dynamics_id
+    )
+
+    expected = generate_dynamics(spec, job, attempt=1)
+    actual = generate_dynamics_bounded(spec, job, chunk_rounds=64, attempt=1)
+
+    np.testing.assert_array_equal(actual.component_probability, expected.component_probability)
+    np.testing.assert_array_equal(actual.latent_factor, expected.latent_factor)
+    assert actual.generator_metadata == expected.generator_metadata
+    assert actual.missingness_parameters == expected.missingness_parameters
+    assert actual.observation_flip_probability == expected.observation_flip_probability
+
+
+@pytest.mark.parametrize("dynamics_id", ["f06", "f12"])
+def test_remaining_bounded_dynamics_match_standard_without_fallback(
+    dynamics_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _tiny_pilot_spec()
+    job = next(
+        job for job in expand_jobs(spec, include_sealed=True) if job.dynamics_id == dynamics_id
+    )
+
+    expected = generate_dynamics(spec, job, attempt=1)
+    monkeypatch.setattr(
+        "causaldem_qec.simulate.generate_dynamics",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError(f"bounded {dynamics_id} generation called the standard fallback")
+        ),
+    )
+    actual = generate_dynamics_bounded(spec, job, chunk_rounds=64, attempt=1)
+
+    np.testing.assert_array_equal(actual.component_probability, expected.component_probability)
+    np.testing.assert_array_equal(actual.latent_factor, expected.latent_factor)
+    assert actual.generator_metadata == expected.generator_metadata
 
 
 def test_nonsealed_bounded_resume_preserves_verified_sealed_manifest_entry(
@@ -919,6 +1061,8 @@ def test_pilot_manifest_binds_profile_geometry_and_all_expected_job_keys() -> No
         "trajectories_per_condition": 64,
         "burn_in_rounds": 4096,
         "scored_rounds": 8192,
+        "mode": "standard",
+        "chunk_rounds": None,
     }
     assert len(manifest["expected_job_keys"]) == 88
 
