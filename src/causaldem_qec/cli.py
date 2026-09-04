@@ -378,7 +378,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             else expand_jobs(spec, include_sealed=False)
         )
         jobs = select_pilot_partition(spec, jobs, args.pilot_partition)
-        manifest = generate_matrix(spec, jobs, args.output_root, workers=args.workers)
+        manifest = generate_matrix(
+            spec,
+            jobs,
+            args.output_root,
+            workers=args.workers,
+            execution_options=execution_options,
+            provenance=provenance,
+        )
         print(manifest.manifest_hash)
         return 0
     if args.stage == "generate-pilot":
@@ -430,7 +437,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 provenance=provenance,
             )
         else:
-            manifest = generate_matrix(spec, jobs, args.output_root, workers=args.workers)
+            manifest = generate_matrix(
+                spec,
+                jobs,
+                args.output_root,
+                workers=args.workers,
+                execution_options=execution_options,
+                provenance=provenance,
+            )
         print(
             json.dumps(
                 _pilot_status(

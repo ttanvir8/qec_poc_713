@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from causaldem_qec.artifacts import publish_trajectory
 from causaldem_qec.cli import _execution_context, build_parser, main, select_pilot_partition
 from causaldem_qec.core import (
+    ExecutionOptions,
     LabelTrajectory,
     ManifestProvenance,
     ObservableTrajectory,
@@ -158,6 +160,41 @@ def test_bounded_generation_options_parse_and_flow_into_execution_context() -> N
     assert options.generation_mode == "bounded"
     assert options.generation_chunk_rounds == 256
     assert provenance is None
+
+
+def test_generate_pilot_forwards_bounded_options_to_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Catch the CLI accepting bounded flags but silently using standard generation."""
+    captured: dict[str, object] = {}
+
+    def fake_generate_matrix(*args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(manifest_hash="manifest")
+
+    monkeypatch.setattr("causaldem_qec.cli._pilot_preflight", lambda *args: 1)
+    monkeypatch.setattr("causaldem_qec.cli.generate_matrix", fake_generate_matrix)
+
+    assert main(
+        [
+            "generate-pilot",
+            "--config",
+            "configs/poc_pilot.json",
+            "--output-root",
+            str(tmp_path),
+            "--pilot-partition",
+            "shard1",
+            "--generation-mode",
+            "bounded",
+            "--generation-chunk-rounds",
+            "256",
+        ]
+    ) == 0
+
+    options = captured["execution_options"]
+    assert isinstance(options, ExecutionOptions)
+    assert options.generation_mode == "bounded"
+    assert options.generation_chunk_rounds == 256
 
 
 def test_bounded_generation_requires_a_chunk_size() -> None:

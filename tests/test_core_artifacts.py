@@ -1291,6 +1291,42 @@ def test_publish_resumes_only_an_identical_artifact_pair(
     assert tuple(verify_artifact(path) for path in second) == first_hashes
 
 
+def test_publish_uses_job_private_staging_outside_the_artifact_tree(
+    tmp_path: Path, tiny_job: TrajectoryJob
+) -> None:
+    """Catch bounded staging paths being mistaken for a completed observable/label artifact."""
+    staging_root = tmp_path / ".staging" / tiny_job.condition_id / str(tiny_job.trajectory_id) / "0"
+
+    observable_path, label_path = publish_trajectory(
+        tmp_path,
+        tiny_job,
+        _observable(),
+        _labels(),
+        {"schema_version": 1},
+        staging_root=staging_root,
+    )
+
+    assert verify_artifact(observable_path)
+    assert verify_artifact(label_path)
+    assert not staging_root.exists()
+
+
+def test_npz_writer_streams_members_without_a_whole_array_buffer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch publication buffering an entire array in BytesIO before ZIP output."""
+    path = tmp_path / "arrays.npz"
+    monkeypatch.setattr(
+        artifact_module.zipfile.ZipFile,
+        "writestr",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("whole-array buffer allocated")),
+    )
+    artifact_module._write_deterministic_npz(path, {"values": np.arange(16, dtype=np.float64)})
+
+    with np.load(path, allow_pickle=False) as archive:
+        np.testing.assert_array_equal(archive["values"], np.arange(16, dtype=np.float64))
+
+
 def test_publish_never_overwrites_conflicting_complete_artifact(
     tmp_path: Path, tiny_job: TrajectoryJob
 ) -> None:

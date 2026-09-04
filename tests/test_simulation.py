@@ -20,21 +20,29 @@ from causaldem_qec.core import (
     load_spec,
 )
 from causaldem_qec.simulate import (
+    BOUNDED_GENERATION_LAW_VERSION,
+    BOUNDED_SAMPLING_LAW_VERSION,
     NOISE_KIND,
     AuditContext,
     GateStatus,
+    GenerationRequest,
+    _future_block_probability,
     _manifest_payload,
+    assemble_artifacts,
     assert_run_manifest_identity,
     bounded_probability,
+    canonicalize_bounded_dem_truth,
     canonicalize_dem,
     canonicalize_dem_truth,
     canonicalize_test_dem,
     component_layout,
     dataset_gates_complete,
+    episode_fault_seed,
     generate_bounded_checkpoint,
     generate_dynamics,
     generate_dynamics_bounded,
     generate_matrix,
+    process_memory_snapshot,
     run_dataset_gates,
     select_incomplete_jobs,
     xor_compose,
@@ -211,18 +219,119 @@ def test_sampled_circuit_phase_is_the_episode_round(job_for_family) -> None:
     np.testing.assert_array_equal(sampled.circuit_phase, np.tile(np.arange(32, dtype=np.uint8), 2))
 
 
-def test_bounded_sampling_preserves_full_sampler_output() -> None:
+def test_bounded_sampling_is_invariant_to_chunk_grouping() -> None:
     spec = _tiny_pilot_spec()
     job = next(job for job in expand_jobs(spec, include_sealed=False) if job.dynamics_id == "f01")
     path = generate_dynamics(spec, job, scored_rounds=256, burn_in=32)
 
-    standard = sample_trajectory(spec, job, path, attempt=1)
-    bounded = sample_trajectory_bounded(spec, job, path, chunk_rounds=64, attempt=1)
+    small_chunks = sample_trajectory_bounded(spec, job, path, chunk_rounds=32, attempt=1)
+    large_chunks = sample_trajectory_bounded(spec, job, path, chunk_rounds=64, attempt=1)
 
-    np.testing.assert_array_equal(bounded.detector_bits, standard.detector_bits)
-    np.testing.assert_array_equal(bounded.detector_valid, standard.detector_valid)
-    np.testing.assert_array_equal(bounded.logical_observable, standard.logical_observable)
-    assert str(bounded.circuit) == str(standard.circuit)
+    np.testing.assert_array_equal(small_chunks.detector_bits, large_chunks.detector_bits)
+    np.testing.assert_array_equal(small_chunks.detector_valid, large_chunks.detector_valid)
+    np.testing.assert_array_equal(small_chunks.logical_observable, large_chunks.logical_observable)
+
+
+def test_bounded_sampling_releases_the_trajectory_circuit() -> None:
+    """Catch bounded sampling retaining the monolithic Stim circuit after episode sampling."""
+    spec = _tiny_pilot_spec()
+    job = next(job for job in expand_jobs(spec, include_sealed=False) if job.dynamics_id == "f01")
+    path = generate_dynamics(spec, job, scored_rounds=64, burn_in=8)
+
+    sampled = sample_trajectory_bounded(spec, job, path, chunk_rounds=32, attempt=1)
+
+    assert sampled.circuit is None
+
+
+def test_bounded_sampling_writes_observations_to_memory_maps(tmp_path: Path) -> None:
+    """Catch bounded sampling retaining detector lanes as trajectory-sized heap arrays."""
+    spec = _tiny_pilot_spec()
+    job = next(job for job in expand_jobs(spec, include_sealed=False) if job.dynamics_id == "f01")
+    path = generate_dynamics(spec, job, scored_rounds=64, burn_in=8)
+
+    sampled = sample_trajectory_bounded(spec, job, path, chunk_rounds=32, staging_root=tmp_path)
+
+    assert isinstance(sampled.detector_bits, np.memmap)
+    assert isinstance(sampled.detector_valid, np.memmap)
+    assert (tmp_path / "detector_bits.npy").is_file()
+    assert (tmp_path / "detector_valid.npy").is_file()
+
+
+def test_episode_fault_seed_is_stable_and_unique_per_episode() -> None:
+    """Catch a bounded run accidentally reusing a trajectory-wide fault seed."""
+    spec = _tiny_pilot_spec()
+    job = next(job for job in expand_jobs(spec, include_sealed=False) if job.dynamics_id == "f01")
+
+    first = episode_fault_seed(spec, job, attempt=1, episode_index=3)
+    repeated = episode_fault_seed(spec, job, attempt=1, episode_index=3)
+    next_episode = episode_fault_seed(spec, job, attempt=1, episode_index=4)
+
+    assert first == repeated
+    assert first != next_episode
+
+
+def test_bounded_metadata_commits_the_new_generation_and_sampling_laws() -> None:
+    """Catch bounded artifacts that can be confused with the historical dataset law."""
+    spec = _tiny_pilot_spec()
+    job = next(job for job in expand_jobs(spec, include_sealed=False) if job.dynamics_id == "f01")
+    request = GenerationRequest(
+        spec,
+        job,
+        Path("."),
+        generation_mode="bounded",
+        generation_chunk_rounds=32,
+    )
+    path = generate_dynamics_bounded(spec, job, chunk_rounds=32)
+    sampled = sample_trajectory_bounded(spec, job, path, chunk_rounds=32)
+
+    _, _, metadata = assemble_artifacts(request, path, sampled, attempt=0)
+
+    assert metadata["generation_law"]["generation_law_version"] == BOUNDED_GENERATION_LAW_VERSION
+    assert metadata["generation_law"]["sampling_law_version"] == BOUNDED_SAMPLING_LAW_VERSION
+
+
+def test_bounded_catalog_aggregates_all_episode_dem_events() -> None:
+    """Catch a bounded catalog derived from only the first episode's event probabilities."""
+    spec = _tiny_pilot_spec()
+    job = next(job for job in expand_jobs(spec, include_sealed=False) if job.dynamics_id == "f01")
+    path = generate_dynamics_bounded(spec, job, chunk_rounds=32)
+    request = GenerationRequest(spec, job, Path("."), generation_mode="bounded", generation_chunk_rounds=32)
+    sampled = sample_trajectory_bounded(spec, job, path, chunk_rounds=32)
+
+    _, _, metadata = assemble_artifacts(request, path, sampled, attempt=0)
+    first_episode = build_memory_episode(job.circuit, path.component_probability[:32], 0, spec)
+    first_catalog = canonicalize_dem(first_episode.circuit, (first_episode,))
+
+    assert metadata["canonical_catalog_hash"] != first_catalog.catalog_hash
+
+
+def test_bounded_catalog_writes_class_probabilities_to_a_memory_map(tmp_path: Path) -> None:
+    """Catch the bounded DEM second pass allocating its complete class lane on the heap."""
+    spec = _tiny_pilot_spec()
+    job = next(job for job in expand_jobs(spec, include_sealed=False) if job.dynamics_id == "f01")
+    path = generate_dynamics_bounded(spec, job, chunk_rounds=32)
+
+    truth = canonicalize_bounded_dem_truth(spec, job, path, staging_root=tmp_path)
+
+    assert isinstance(truth.class_probability, np.memmap)
+    assert (tmp_path / "class_probability.npy").is_file()
+
+
+def test_future_block_probability_writes_to_a_memory_map(tmp_path: Path) -> None:
+    """Catch forecast labels allocating a second trajectory-sized heap array."""
+    source = np.arange(64, dtype=np.float64).reshape(32, 2)
+
+    future = _future_block_probability(source, 8, staging_path=tmp_path / "future.npy")
+
+    assert isinstance(future, np.memmap)
+    assert (tmp_path / "future.npy").is_file()
+
+
+def test_process_memory_snapshot_reports_positive_peak_rss() -> None:
+    """Catch bounded-job diagnostics omitting the RSS value needed for Kaggle safety checks."""
+    snapshot = process_memory_snapshot()
+
+    assert snapshot["peak_rss_bytes"] > 0
 
 
 def test_generator_metadata_contains_resolved_reproduction_parameters(job_for_family) -> None:
@@ -576,7 +685,7 @@ def test_bounded_generation_is_deterministic_across_clean_and_resumed_runs(
     assert second.trajectory_hashes == clean.trajectory_hashes
 
 
-def test_bounded_and_standard_generation_have_identical_f01_artifact_hashes(
+def test_bounded_and_standard_generation_have_distinct_f01_artifact_hashes(
     tmp_path: Path,
 ) -> None:
     spec = _tiny_pilot_spec()
@@ -595,10 +704,12 @@ def test_bounded_and_standard_generation_have_identical_f01_artifact_hashes(
         execution_options=bounded_options,
     )
 
-    assert bounded.trajectory_hashes == standard.trajectory_hashes
+    assert bounded.trajectory_hashes != standard.trajectory_hashes
     manifest = json.loads((tmp_path / "bounded" / "run_manifest.json").read_text(encoding="utf-8"))
     assert manifest["generation"]["mode"] == "bounded"
     assert manifest["generation"]["chunk_rounds"] == 64
+    assert manifest["generation"]["generation_law_version"] == BOUNDED_GENERATION_LAW_VERSION
+    assert manifest["generation"]["sampling_law_version"] == BOUNDED_SAMPLING_LAW_VERSION
 
 
 def test_f01_bounded_dynamics_streams_chunks_without_standard_fallback(
@@ -617,6 +728,19 @@ def test_f01_bounded_dynamics_streams_chunks_without_standard_fallback(
     np.testing.assert_array_equal(actual.component_probability, expected.component_probability)
     np.testing.assert_array_equal(actual.latent_factor, expected.latent_factor)
     assert actual.generator_metadata == expected.generator_metadata
+
+
+def test_bounded_dynamics_writes_final_lanes_as_memory_maps(tmp_path: Path) -> None:
+    """Catch bounded dynamics collecting all chunk arrays before returning its final lanes."""
+    spec = _tiny_pilot_spec()
+    job = next(job for job in expand_jobs(spec, include_sealed=False) if job.dynamics_id == "f01")
+
+    path = generate_dynamics_bounded(spec, job, chunk_rounds=32, staging_root=tmp_path)
+
+    assert isinstance(path.component_probability, np.memmap)
+    assert isinstance(path.latent_factor, np.memmap)
+    assert (tmp_path / "component_probability.npy").is_file()
+    assert (tmp_path / "latent_factor.npy").is_file()
 
 
 @pytest.mark.parametrize("dynamics_id", ["f02", "f14_positive", "f14_negative"])
@@ -1063,6 +1187,8 @@ def test_pilot_manifest_binds_profile_geometry_and_all_expected_job_keys() -> No
         "scored_rounds": 8192,
         "mode": "standard",
         "chunk_rounds": None,
+        "generation_law_version": "standard_monolithic_v1",
+        "sampling_law_version": "fault_v1",
     }
     assert len(manifest["expected_job_keys"]) == 88
 

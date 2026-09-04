@@ -3,7 +3,6 @@ from __future__ import annotations
 import ctypes
 import errno
 import hashlib
-import io
 import json
 import os
 import shutil
@@ -93,11 +92,10 @@ def _fsync_directory(path: Path) -> None:
 def _write_deterministic_npz(path: Path, arrays: Mapping[str, np.ndarray]) -> None:
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
         for name in sorted(arrays):
-            data = io.BytesIO()
-            np.lib.format.write_array(data, arrays[name], allow_pickle=False)
             info = zipfile.ZipInfo(f"{name}.npy", date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_STORED
-            archive.writestr(info, data.getvalue())
+            with archive.open(info, "w") as member:
+                np.lib.format.write_array(member, arrays[name], allow_pickle=False)
     _fsync_file(path)
 
 
@@ -259,9 +257,10 @@ def _reject_raw_seed_metadata(value: object) -> None:
             _reject_raw_seed_metadata(item)
 
 
-def _staging_directory(target: Path) -> Path:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    return Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
+def _staging_directory(target: Path, staging_root: Path | None = None) -> Path:
+    parent = target.parent if staging_root is None else staging_root
+    parent.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=parent))
 
 
 def _observable_arrays(trajectory: ObservableTrajectory) -> dict[str, np.ndarray]:
@@ -382,6 +381,8 @@ def publish_trajectory(
     observable: ObservableTrajectory,
     labels: LabelTrajectory,
     metadata: Mapping[str, object],
+    *,
+    staging_root: Path | None = None,
 ) -> tuple[Path, Path]:
     """Atomically publish a verified detector-only and offline-label artifact pair."""
     validate_observable(observable)
@@ -394,8 +395,14 @@ def publish_trajectory(
     )
     label_path = root / "data" / "labels" / job.split / job.condition_id / str(job.trajectory_id)
     pair_id = _pair_id(job, metadata)
-    observable_staging = _staging_directory(observable_path)
-    label_staging = _staging_directory(label_path)
+    observable_path.parent.mkdir(parents=True, exist_ok=True)
+    label_path.parent.mkdir(parents=True, exist_ok=True)
+    observable_staging = _staging_directory(
+        observable_path, None if staging_root is None else staging_root / "observable"
+    )
+    label_staging = _staging_directory(
+        label_path, None if staging_root is None else staging_root / "labels"
+    )
     observable_identity: tuple[int, int] | None = None
     label_identity: tuple[int, int] | None = None
     try:
@@ -439,6 +446,8 @@ def publish_trajectory(
         if label_staging.exists():
             shutil.rmtree(label_staging)
         raise
+    if staging_root is not None:
+        shutil.rmtree(staging_root)
     return observable_path, label_path
 
 

@@ -4,6 +4,7 @@ import concurrent.futures
 import hashlib
 import importlib.metadata
 import json
+import resource
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -46,6 +47,23 @@ from causaldem_qec.core import (
 )
 
 STANDARD_GENERATION_LAW_VERSION = "standard_monolithic_v1"
+BOUNDED_GENERATION_LAW_VERSION = "bounded_episode_stream_v2"
+BOUNDED_SAMPLING_LAW_VERSION = "episode_seeded_stim_v1"
+
+
+def process_memory_snapshot() -> Mapping[str, int | None]:
+    """Return a low-overhead process peak RSS and available-memory snapshot in bytes."""
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peak_bytes = int(peak) if __import__("sys").platform == "darwin" else int(peak) * 1024
+    available: int | None = None
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            if line.startswith("MemAvailable:"):
+                available = int(line.split()[1]) * 1024
+                break
+    except OSError:
+        pass
+    return MappingProxyType({"peak_rss_bytes": peak_bytes, "available_memory_bytes": available})
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,7 +185,7 @@ DATASET_GATES = (
 
 @dataclass(frozen=True, slots=True)
 class SampledTrajectory:
-    circuit: stim.Circuit
+    circuit: stim.Circuit | None
     detector_bits: np.ndarray
     detector_valid: np.ndarray
     logical_observable: np.ndarray
@@ -520,6 +538,119 @@ def canonicalize_dem_truth(
         catalog=catalog,
         class_probability=probability,
         dem_hash=sha256(str(dem).encode("utf-8")).hexdigest(),
+    )
+
+
+def canonicalize_bounded_dem_truth(
+    spec: PocSpec,
+    job: TrajectoryJob,
+    path: PhysicalNoisePath,
+    *,
+    staging_root: Path | None = None,
+) -> CanonicalDemTruth:
+    """Compile one episode DEM at a time and assemble its round truth by stable class ID."""
+    episode_count = path.component_probability.shape[0] // spec.episode_rounds
+    summaries: dict[
+        tuple[tuple[int, int, int], ...], tuple[float, set[tuple[int, ...]], bool, int]
+    ] = {}
+    dem_digest = hashlib.sha256()
+    # Pass one retains only one aggregate per signature, never a trajectory DEM.
+    for episode_index in range(episode_count):
+        start = episode_index * spec.episode_rounds
+        stop = start + spec.episode_rounds
+        built = build_memory_episode(job.circuit, path.component_probability[start:stop], 0, spec)
+        dem = built.circuit.detector_error_model(
+            decompose_errors=False, approximate_disjoint_errors=False, flatten_loops=True
+        )
+        for probability, signature, logical, supported, _ in _canonical_dem_events(
+            built.circuit, (built,)
+        ):
+            combined, logicals, all_supported, count = summaries.get(
+                signature, (0.0, set(), True, 0)
+            )
+            summaries[signature] = (
+                probability if count == 0 else combined + probability - 2.0 * combined * probability,
+                logicals | {logical},
+                all_supported and supported,
+                count + 1,
+            )
+        dem_text = str(dem).encode("utf-8")
+        dem_digest.update(len(dem_text).to_bytes(8, "big"))
+        dem_digest.update(dem_text)
+        del built, dem
+    if not summaries:
+        raise InvalidCircuit("bounded DEM assembly did not process an episode")
+    classes: list[CanonicalClass] = []
+    for class_id, signature in enumerate(sorted(summaries)):
+        probability, logicals, supported, _ = summaries[signature]
+        logical_signatures = tuple(sorted(logicals))
+        graphlike = len(signature) in (1, 2)
+        decoder_compatible = len(logical_signatures) == 1 and supported
+        classes.append(
+            CanonicalClass(
+                class_id=class_id,
+                detector_signature=signature,
+                logical_signatures=logical_signatures,
+                probability=probability,
+                support_size=len(signature),
+                graphlike=graphlike,
+                supported=supported,
+                decoder_compatible=decoder_compatible,
+                adaptable=graphlike and decoder_compatible,
+            )
+        )
+    canonical = [
+        {
+            "class_id": item.class_id,
+            "detectors": item.detector_signature,
+            "logicals": item.logical_signatures,
+            "probability": item.probability,
+            "support_size": item.support_size,
+            "graphlike": item.graphlike,
+            "supported": item.supported,
+            "decoder_compatible": item.decoder_compatible,
+            "adaptable": item.adaptable,
+        }
+        for item in classes
+    ]
+    catalog = CanonicalCatalog(
+        classes=tuple(classes),
+        duplicate_sizes=tuple(summaries[item.detector_signature][3] for item in classes),
+        graphlike_mass=sum(item.probability for item in classes if item.graphlike),
+        adaptable_mass=sum(item.probability for item in classes if item.adaptable),
+        ambiguous_logical_mass=sum(
+            item.probability for item in classes if len(item.logical_signatures) != 1
+        ),
+        hyperedge_mass=sum(item.probability for item in classes if not item.graphlike),
+        unsupported_static_mass=sum(
+            summaries[item.detector_signature][0] for item in classes if not item.supported
+        ),
+        catalog_hash=sha256(json.dumps(canonical, sort_keys=True).encode("utf-8")).hexdigest(),
+    )
+    class_shape = (path.component_probability.shape[0], len(catalog.classes))
+    if staging_root is None:
+        class_probability = np.zeros(class_shape, dtype=np.float64)
+    else:
+        staging_root.mkdir(parents=True, exist_ok=True)
+        class_probability = np.lib.format.open_memmap(
+            staging_root / "class_probability.npy", mode="w+", dtype=np.float64, shape=class_shape
+        )
+    class_index = {item.detector_signature: item.class_id for item in catalog.classes}
+    # Pass two reconstructs one episode at a time and writes only its 32 rows.
+    for episode_index in range(episode_count):
+        start = episode_index * spec.episode_rounds
+        stop = start + spec.episode_rounds
+        built = build_memory_episode(job.circuit, path.component_probability[start:stop], 0, spec)
+        episode_truth = canonicalize_dem_truth(built.circuit, (built,))
+        for local_class in episode_truth.catalog.classes:
+            class_probability[start:stop, class_index[local_class.detector_signature]] = (
+                episode_truth.class_probability[:, local_class.class_id]
+            )
+        del built, episode_truth
+    return CanonicalDemTruth(
+        catalog=catalog,
+        class_probability=class_probability,
+        dem_hash=dem_digest.hexdigest(),
     )
 
 
@@ -949,6 +1080,28 @@ def _rng(spec: PocSpec, job: TrajectoryJob, stream: str, attempt: int = 0) -> np
     return np.random.default_rng(seed)
 
 
+def episode_fault_seed(
+    spec: PocSpec,
+    job: TrajectoryJob,
+    *,
+    attempt: int,
+    episode_index: int,
+) -> int:
+    """Return the scheduler-independent Stim seed for one bounded episode."""
+    if episode_index < 0:
+        raise ValueError("episode index must be non-negative")
+    seed = derive_seed(
+        job.root_seed,
+        _integer(spec.raw["schema_version"], "schema_version"),
+        job.condition_id,
+        job.trajectory_id,
+        "fault_episode",
+        attempt,
+        episode_index,
+    )
+    return int(seed.generate_state(1, dtype=np.uint64)[0])
+
+
 def _config_float(spec: PocSpec, family: str, name: str) -> float:
     return _number(spec.dynamics[family][name], f"{family}.{name}")
 
@@ -1210,6 +1363,7 @@ def generate_dynamics_bounded(
     *,
     chunk_rounds: int,
     attempt: int = 0,
+    staging_root: Path | None = None,
 ) -> PhysicalNoisePath:
     """Generate a bounded-mode path while retaining the standard stream contract."""
     if chunk_rounds < 1 or chunk_rounds % spec.episode_rounds:
@@ -1238,9 +1392,22 @@ def generate_dynamics_bounded(
         return generate_dynamics(spec, job, scored, discarded, attempt=attempt)
 
     dynamics_rng = _rng(spec, job, "dynamics", attempt)
-    probabilities: list[np.ndarray] = []
-    factors: list[np.ndarray] = []
     factor_count = min(2, len(components))
+    factor_width = 2 if job.dynamics_id in {"f03", "f06", "f07", "f08", "f12", "f14_positive", "f14_negative"} else factor_count
+    if staging_root is None:
+        probabilities: np.ndarray = np.empty((scored, len(components)), dtype=np.float64)
+        factors: np.ndarray = np.empty((scored, factor_width), dtype=np.float64)
+    else:
+        staging_root.mkdir(parents=True, exist_ok=True)
+        probabilities = np.lib.format.open_memmap(
+            staging_root / "component_probability.npy", mode="w+", dtype=np.float64,
+            shape=(scored, len(components)),
+        )
+        factors = np.lib.format.open_memmap(
+            staging_root / "latent_factor.npy", mode="w+", dtype=np.float64,
+            shape=(scored, factor_width),
+        )
+    scored_offset = 0
     offset_state: np.ndarray | None = None
     offsets: np.ndarray | None = None
     burn_in_final_state: np.ndarray | None = None
@@ -1410,8 +1577,14 @@ def generate_dynamics_bounded(
         scored_start = max(discarded, start)
         if scored_start < stop:
             scored_latent = chunk_latent[scored_start - start :]
-            probabilities.append(bounded_probability(scored_latent, lower, upper))
-            factors.append(np.asarray(chunk_factors[scored_start - start :], dtype=np.float64))
+            rows = stop - scored_start
+            probabilities[scored_offset : scored_offset + rows] = bounded_probability(
+                scored_latent, lower, upper
+            )
+            factors[scored_offset : scored_offset + rows] = np.asarray(
+                chunk_factors[scored_start - start :], dtype=np.float64
+            )
+            scored_offset += rows
 
     layout_commitment = sha256(
         repr(tuple((item.kind, item.targets) for item in components)).encode("utf-8")
@@ -1453,8 +1626,8 @@ def generate_dynamics_bounded(
         }
     )
     return PhysicalNoisePath(
-        component_probability=np.concatenate(probabilities, axis=0),
-        latent_factor=np.concatenate(factors, axis=0),
+        component_probability=probabilities,
+        latent_factor=factors,
         lower_bound=lower,
         upper_bound=upper,
         missingness_parameters=missingness,
@@ -1736,14 +1909,87 @@ def sample_trajectory_bounded(
     *,
     chunk_rounds: int,
     attempt: int = 0,
+    staging_root: Path | None = None,
 ) -> SampledTrajectory:
-    """Build episodes in bounded groups while retaining the full Stim sampler."""
-    return _sample_trajectory_with_chunked_episodes(
-        spec,
-        job,
-        path,
-        chunk_rounds=chunk_rounds,
-        attempt=attempt,
+    """Sample independently seeded episodes without retaining a trajectory circuit."""
+    rounds = path.component_probability.shape[0]
+    if rounds == 0 or rounds % spec.episode_rounds:
+        raise InvalidPhysicalPath("sampled rounds must contain complete episodes")
+    if chunk_rounds < 1 or chunk_rounds % spec.episode_rounds:
+        raise InvalidPhysicalPath("sampling chunk rounds must be a positive episode-aligned value")
+    components = component_layout(job.circuit)
+    if path.component_probability.shape[1] != len(components):
+        raise InvalidPhysicalPath("physical path component layout mismatch")
+
+    episode_count = rounds // spec.episode_rounds
+    detector_bits: np.ndarray | None = None
+    present: np.ndarray | None = None
+    logical_observable = np.zeros(episode_count, dtype=np.bool_)
+    for episode_index in range(episode_count):
+        start = episode_index * spec.episode_rounds
+        stop = start + spec.episode_rounds
+        # Observable zero is local to this circuit. Its output is written to the
+        # corresponding trajectory episode, avoiding a trajectory-wide circuit.
+        built = build_memory_episode(job.circuit, path.component_probability[start:stop], 0, spec)
+        sampler = built.circuit.compile_detector_sampler(
+            seed=episode_fault_seed(spec, job, attempt=attempt, episode_index=episode_index)
+        )
+        detectors, observables = sampler.sample(shots=1, separate_observables=True, bit_packed=False)
+        max_role = int(built.detector_role.max()) + 1
+        if detector_bits is None:
+            if staging_root is None:
+                detector_bits = np.zeros((rounds, max_role), dtype=np.bool_)
+                present = np.zeros((rounds, max_role), dtype=np.bool_)
+            else:
+                staging_root.mkdir(parents=True, exist_ok=True)
+                detector_bits = np.lib.format.open_memmap(
+                    staging_root / "detector_bits.npy", mode="w+", dtype=np.bool_, shape=(rounds, max_role)
+                )
+                present = np.lib.format.open_memmap(
+                    staging_root / "detector_present.npy", mode="w+", dtype=np.bool_, shape=(rounds, max_role)
+                )
+        elif detector_bits.shape[1] != max_role:
+            raise InvalidCircuit("episode detector roles are not stable")
+        assert detector_bits is not None and present is not None
+        for local_index, source_round in enumerate(built.detector_round):
+            detector_bits[start + int(source_round), int(built.detector_role[local_index])] = detectors[
+                0, local_index
+            ]
+            present[start + int(source_round), int(built.detector_role[local_index])] = True
+        if observables.shape != (1, 1):
+            raise InvalidCircuit("episode sampler did not return exactly one local observable")
+        logical_observable[episode_index] = observables[0, 0]
+        del sampler, built, detectors, observables
+
+    if detector_bits is None or present is None:
+        raise InvalidCircuit("bounded sampler did not process an episode")
+    validity = _apply_missingness(
+        detector_bits, present, path.missingness_parameters, _rng(spec, job, "missingness", attempt)
+    )
+    if staging_root is None:
+        detector_valid = validity
+    else:
+        detector_valid = np.lib.format.open_memmap(
+            staging_root / "detector_valid.npy", mode="w+", dtype=np.bool_, shape=validity.shape
+        )
+        detector_valid[...] = validity
+        del validity
+    if path.contamination_is_post_sampling:
+        flips = (
+            _rng(spec, job, "contamination", attempt).random(detector_bits.shape)
+            < path.observation_flip_probability
+        )
+        detector_bits[present & flips] ^= True
+    global_round = np.arange(rounds, dtype=np.uint32)
+    return SampledTrajectory(
+        circuit=None,
+        detector_bits=detector_bits,
+        detector_valid=detector_valid,
+        logical_observable=logical_observable,
+        episode=global_round // np.uint32(spec.episode_rounds),
+        round_in_episode=global_round % np.uint32(spec.episode_rounds),
+        detector_role=np.arange(detector_bits.shape[1], dtype=np.uint16),
+        circuit_phase=(global_round % np.uint32(32)).astype(np.uint8),
     )
 
 
@@ -1781,8 +2027,24 @@ def _package_versions() -> Mapping[str, str]:
     )
 
 
-def _future_block_probability(class_probability: np.ndarray, block_rounds: int) -> np.ndarray:
-    future = np.zeros_like(class_probability)
+def _future_block_probability(
+    class_probability: np.ndarray,
+    block_rounds: int,
+    *,
+    staging_path: Path | None = None,
+) -> np.ndarray:
+    future = (
+        np.zeros_like(class_probability)
+        if staging_path is None
+        else np.lib.format.open_memmap(
+            staging_path,
+            mode="w+",
+            dtype=class_probability.dtype,
+            shape=class_probability.shape,
+        )
+    )
+    if staging_path is not None:
+        future[...] = 0.0
     block_count = class_probability.shape[0] // block_rounds
     for block in range(block_count - 2):
         start, stop = (block + 2) * block_rounds, (block + 3) * block_rounds
@@ -1841,39 +2103,21 @@ def assemble_artifacts(
     sampled: SampledTrajectory,
     *,
     attempt: int,
+    staging_root: Path | None = None,
 ) -> tuple[ObservableTrajectory, LabelTrajectory, Mapping[str, object]]:
     """Assemble auditable public and offline-only lanes from one deterministic sample."""
     spec, job = request.spec, request.job
     episode_count = path.component_probability.shape[0] // spec.episode_rounds
-    episode_map: list[BuiltEpisode | EpisodeLayout]
     if request.generation_mode == "bounded":
         chunk_rounds = request.generation_chunk_rounds
         if chunk_rounds is None or chunk_rounds % spec.episode_rounds:
             raise InvalidPhysicalPath("bounded assembly requires an episode-aligned chunk size")
-        episodes_per_chunk = chunk_rounds // spec.episode_rounds
-        episode_map = []
-        for chunk_start in range(0, episode_count, episodes_per_chunk):
-            chunk_stop = min(episode_count, chunk_start + episodes_per_chunk)
-            for index in range(chunk_start, chunk_stop):
-                built = build_memory_episode(
-                    job.circuit,
-                    path.component_probability[
-                        index * spec.episode_rounds : (index + 1) * spec.episode_rounds
-                    ],
-                    index,
-                    spec,
-                )
-                episode_map.append(
-                    EpisodeLayout(
-                        detector_round=built.detector_round,
-                        detector_role=built.detector_role,
-                        detector_phase=built.detector_phase,
-                        round_instruction_ranges=built.round_instruction_ranges,
-                        circuit_length=len(list(built.circuit)),
-                    )
-                )
+        truth = canonicalize_bounded_dem_truth(spec, job, path, staging_root=staging_root)
+        circuit_hash = canonical_digest(
+            {"bounded_dem_hash": truth.dem_hash, "episode_count": episode_count}
+        )
     else:
-        episode_map = [
+        episode_map: list[BuiltEpisode | EpisodeLayout] = [
             build_memory_episode(
                 job.circuit,
                 path.component_probability[
@@ -1884,7 +2128,10 @@ def assemble_artifacts(
             )
             for index in range(episode_count)
         ]
-    truth = canonicalize_dem_truth(sampled.circuit, episode_map)
+        if sampled.circuit is None:
+            raise InvalidCircuit("standard sampling requires a trajectory circuit")
+        truth = canonicalize_dem_truth(sampled.circuit, episode_map)
+        circuit_hash = hashlib.sha256(str(sampled.circuit).encode("utf-8")).hexdigest()
     global_round = np.arange(path.component_probability.shape[0], dtype=np.uint32)
     observable = ObservableTrajectory(
         detector_bits=sampled.detector_bits,
@@ -1903,7 +2150,11 @@ def assemble_artifacts(
         latent_factor=path.latent_factor,
         class_probability=truth.class_probability,
         future_block_probability=_future_block_probability(
-            truth.class_probability, spec.block_rounds
+            truth.class_probability,
+            spec.block_rounds,
+            staging_path=(staging_root / "future_block_probability.npy")
+            if request.generation_mode == "bounded" and staging_root is not None
+            else None,
         ),
     )
     config_hash = _resolved_config_hash(spec)
@@ -1915,7 +2166,7 @@ def assemble_artifacts(
         "condition_id": job.condition_id,
         "trajectory_id": job.trajectory_id,
         "split": job.split,
-        "circuit_hash": hashlib.sha256(str(sampled.circuit).encode("utf-8")).hexdigest(),
+        "circuit_hash": circuit_hash,
         "undecomposed_dem_hash": truth.dem_hash,
         "canonical_catalog_hash": truth.catalog.catalog_hash,
         "canonical_catalog": {
@@ -1928,6 +2179,16 @@ def assemble_artifacts(
         },
         "dynamics_hash": canonical_digest(path.generator_metadata),
         "generation_law": {
+            "generation_law_version": (
+                BOUNDED_GENERATION_LAW_VERSION
+                if request.generation_mode == "bounded"
+                else STANDARD_GENERATION_LAW_VERSION
+            ),
+            "sampling_law_version": (
+                BOUNDED_SAMPLING_LAW_VERSION if request.generation_mode == "bounded" else "fault_v1"
+            ),
+            "generation_mode": request.generation_mode,
+            "generation_chunk_rounds": request.generation_chunk_rounds,
             "dynamics_id": job.dynamics_id,
             "component_bounds": path.generator_metadata["component_bounds"],
             "missingness_parameters": dict(path.missingness_parameters),
@@ -1961,6 +2222,13 @@ def generate_job(request: GenerationRequest) -> TrajectoryResult:
             if request.generation_mode == "bounded":
                 if request.generation_chunk_rounds is None:
                     raise InvalidPhysicalPath("bounded generation requires a chunk size")
+                staging_root = (
+                    request.root
+                    / ".staging"
+                    / request.job.condition_id
+                    / str(request.job.trajectory_id)
+                    / str(attempt)
+                )
                 path = generate_dynamics_bounded(
                     request.spec,
                     request.job,
@@ -1968,6 +2236,7 @@ def generate_job(request: GenerationRequest) -> TrajectoryResult:
                     request.spec.burn_in_rounds,
                     chunk_rounds=request.generation_chunk_rounds,
                     attempt=attempt,
+                    staging_root=staging_root / "lanes",
                 )
             else:
                 path = generate_dynamics(
@@ -1986,13 +2255,25 @@ def generate_job(request: GenerationRequest) -> TrajectoryResult:
                     path,
                     chunk_rounds=request.generation_chunk_rounds,
                     attempt=attempt,
+                    staging_root=staging_root / "lanes",
                 )
             else:
                 sampled = sample_trajectory(request.spec, request.job, path, attempt=attempt)
             observable, labels, metadata = assemble_artifacts(
-                request, path, sampled, attempt=attempt
+                request,
+                path,
+                sampled,
+                attempt=attempt,
+                staging_root=staging_root / "lanes" if request.generation_mode == "bounded" else None,
             )
-            publish_trajectory(request.root, request.job, observable, labels, metadata)
+            publish_trajectory(
+                request.root,
+                request.job,
+                observable,
+                labels,
+                metadata,
+                staging_root=staging_root if request.generation_mode == "bounded" else None,
+            )
             hashes = verify_trajectory_pair(
                 request.root,
                 request.job,
@@ -2030,6 +2311,14 @@ def _manifest_payload(
             "scored_rounds": spec.scored_rounds,
             "mode": generation_mode,
             "chunk_rounds": generation_chunk_rounds,
+            "generation_law_version": (
+                BOUNDED_GENERATION_LAW_VERSION
+                if generation_mode == "bounded"
+                else STANDARD_GENERATION_LAW_VERSION
+            ),
+            "sampling_law_version": (
+                BOUNDED_SAMPLING_LAW_VERSION if generation_mode == "bounded" else "fault_v1"
+            ),
         },
         "results": [
             {
@@ -2364,6 +2653,16 @@ def assert_run_manifest_identity(
                 generation_chunk_rounds
                 if provenance is None
                 else provenance.generation_chunk_rounds
+            ),
+            "generation_law_version": (
+                BOUNDED_GENERATION_LAW_VERSION
+                if (generation_mode if provenance is None else provenance.generation_mode) == "bounded"
+                else STANDARD_GENERATION_LAW_VERSION
+            ),
+            "sampling_law_version": (
+                BOUNDED_SAMPLING_LAW_VERSION
+                if (generation_mode if provenance is None else provenance.generation_mode) == "bounded"
+                else "fault_v1"
             ),
         }
         if document.get("generation") != expected_generation or document.get(
