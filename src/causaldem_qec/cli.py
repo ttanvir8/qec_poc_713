@@ -30,6 +30,7 @@ from causaldem_qec.simulate import (
 )
 
 _PILOT_RESERVE_GIB = 80
+_BOUNDED_PILOT_RESERVE_GIB = 8
 
 
 class StoragePreflightError(ValueError):
@@ -191,7 +192,7 @@ def _require_pilot_config(config_path: Path, spec: PocSpec) -> None:
         raise ValueError("generate-pilot requires configs/poc_pilot.json")
 
 
-def _pilot_preflight(output_root: Path, spec: PocSpec) -> int:
+def _pilot_preflight(output_root: Path, spec: PocSpec, *, generation_mode: str = "standard") -> int:
     full_run_root = Path(spec.roots["runs"]).resolve()
     if output_root.resolve() in {Path.cwd(), full_run_root}:
         raise ValueError("pilot output root must be distinct from the full-production root")
@@ -200,10 +201,11 @@ def _pilot_preflight(output_root: Path, spec: PocSpec) -> int:
     while not probe.exists():
         probe = probe.parent
     free = shutil.disk_usage(probe).free
-    reserve = _PILOT_RESERVE_GIB * 1024**3
+    reserve_gib = _BOUNDED_PILOT_RESERVE_GIB if generation_mode == "bounded" else _PILOT_RESERVE_GIB
+    reserve = reserve_gib * 1024**3
     if free < reserve:
         raise StoragePreflightError(
-            f"pilot storage preflight requires {_PILOT_RESERVE_GIB} GiB free, found {free} bytes"
+            f"pilot storage preflight requires {reserve_gib} GiB free, found {free} bytes"
         )
     return free
 
@@ -402,7 +404,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 probe = probe.parent
             free_bytes = shutil.disk_usage(probe).free
         else:
-            free_bytes = _pilot_preflight(args.output_root, spec)
+            free_bytes = _pilot_preflight(
+                args.output_root, spec, generation_mode=execution_options.generation_mode
+            )
         jobs = (
             _sealed_jobs(spec, args.sealed_manifest, args.output_root)
             if args.sealed_manifest is not None

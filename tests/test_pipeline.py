@@ -6,7 +6,13 @@ import numpy as np
 import pytest
 
 from causaldem_qec.artifacts import publish_trajectory
-from causaldem_qec.cli import _execution_context, build_parser, main, select_pilot_partition
+from causaldem_qec.cli import (
+    _execution_context,
+    _pilot_preflight,
+    build_parser,
+    main,
+    select_pilot_partition,
+)
 from causaldem_qec.core import (
     ExecutionOptions,
     LabelTrajectory,
@@ -172,7 +178,7 @@ def test_generate_pilot_forwards_bounded_options_to_generation(
         captured.update(kwargs)
         return SimpleNamespace(manifest_hash="manifest")
 
-    monkeypatch.setattr("causaldem_qec.cli._pilot_preflight", lambda *args: 1)
+    monkeypatch.setattr("causaldem_qec.cli._pilot_preflight", lambda *args, **kwargs: 1)
     monkeypatch.setattr("causaldem_qec.cli.generate_matrix", fake_generate_matrix)
 
     assert main(
@@ -210,6 +216,16 @@ def test_bounded_generation_requires_a_chunk_size() -> None:
 
     with pytest.raises(ValueError, match="chunk rounds.*required"):
         _execution_context(args, load_spec(args.config))
+
+
+def test_bounded_pilot_preflight_uses_the_kaggle_shard_storage_reserve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch a bounded shard being rejected by the obsolete 80 GiB monolithic reserve."""
+    spec = load_spec(Path("configs/poc_pilot.json"))
+    monkeypatch.setattr("causaldem_qec.cli.shutil.disk_usage", lambda path: SimpleNamespace(free=19 * 1024**3))
+
+    assert _pilot_preflight(tmp_path / "output", spec, generation_mode="bounded") == 19 * 1024**3
 
 
 def test_bounded_generation_chunk_size_must_align_to_episode_rounds() -> None:
